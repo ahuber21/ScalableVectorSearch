@@ -46,7 +46,7 @@ namespace svs::index::vamana {
 
 // Forward declaration
 template <typename Index, typename QueryType> class BatchIterator;
-template <graphs::MemoryGraph Graph, typename Data, typename Dist>
+template <graphs::MemoryGraph Graph, typename Data, typename Dist, typename Mutex>
 class MultiMutableVamanaIndex;
 
 /////
@@ -109,7 +109,8 @@ class ValidBuilder {
 
 template <graphs::MemoryGraph Graph, typename Data, typename Dist>
 class MutableVamanaIndex {
-    friend class MultiMutableVamanaIndex<Graph, Data, Dist>;
+    template <graphs::MemoryGraph, typename, typename, typename>
+    friend class MultiMutableVamanaIndex;
 
   public:
     // Traits

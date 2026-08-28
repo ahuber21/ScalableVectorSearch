@@ -26,12 +26,17 @@
 #include "catch2/catch_test_macros.hpp"
 
 // stl
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace {
+
+// Verify NullMutex is empty and adds zero overhead via [[no_unique_address]].
+static_assert(std::is_empty_v<svs::lib::NullMutex>);
 
 template <typename Distance> float pick_alpha(Distance SVS_UNUSED(dist)) {
     if constexpr (std::is_same_v<Distance, svs::DistanceL2>) {
