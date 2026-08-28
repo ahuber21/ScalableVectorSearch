@@ -724,3 +724,44 @@ CATCH_TEST_CASE("Vamana Index Save and Load SQ", "[vamana][index][saveload][scal
         CATCH_REQUIRE(modified_distance == Catch::Approx(0.0).epsilon(1e-5));
     }
 }
+
+namespace {
+struct FakeIndex {
+    mutable bool supplemented = false;
+    size_t size() const { return 100; }
+};
+
+struct FakeSearchBuffer {
+    mutable size_t valid_count = 5;
+    size_t target = 10;
+    size_t valid() const { return valid_count; }
+    size_t target_window() const { return target; }
+};
+
+template <typename Query>
+void svs_invoke(
+    svs::tag_t<svs::index::vamana::extensions::check_and_supplement_search_buffer>,
+    const FakeIndex& index,
+    FakeSearchBuffer& search_buffer,
+    const Query& SVS_UNUSED(query)
+) {
+    index.supplemented = true;
+    search_buffer.valid_count = search_buffer.target;
+}
+} // namespace
+
+CATCH_TEST_CASE("check_and_supplement_search_buffer customization", "[vamana][index]") {
+    auto index = FakeIndex{};
+    auto search_buffer = FakeSearchBuffer{};
+    auto query = std::vector<float>{1.0f, 2.0f, 3.0f};
+
+    CATCH_REQUIRE(!index.supplemented);
+    CATCH_REQUIRE(search_buffer.valid() < search_buffer.target_window());
+
+    svs::index::vamana::extensions::check_and_supplement_search_buffer(
+        index, search_buffer, query
+    );
+
+    CATCH_REQUIRE(index.supplemented);
+    CATCH_REQUIRE(search_buffer.valid() == search_buffer.target_window());
+}
