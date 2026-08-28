@@ -22,6 +22,7 @@
 
 // tests
 #include "tests/utils/generators.h"
+#include "tests/utils/logging.h"
 #include "tests/utils/test_dataset.h"
 
 // catch2
@@ -54,7 +55,7 @@ CATCH_TEST_CASE("FlatIndex Logging Test", "[logging]") {
     );
     global_callback_sink->set_level(spdlog::level::trace);
     auto original_logger = svs::logging::get();
-    original_logger->sinks().push_back(global_callback_sink);
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
     std::vector<float> data{1.0f, 2.0f};
     auto dataView = svs::data::SimpleDataView<float>(data.data(), 2, 1);

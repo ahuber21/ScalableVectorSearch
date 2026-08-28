@@ -27,6 +27,7 @@
 
 // tests
 #include "spdlog/sinks/callback_sink.h"
+#include "tests/utils/logging.h"
 #include "tests/utils/test_dataset.h"
 #include "tests/utils/utils.h"
 #include "tests/utils/vamana_reference.h"
@@ -282,7 +283,7 @@ CATCH_TEST_CASE("Testing Graph Index", "[graph_index][dynamic_index]") {
     );
     global_callback_sink->set_level(spdlog::level::trace);
     auto original_logger = svs::logging::get();
-    original_logger->sinks().push_back(global_callback_sink);
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
     // Load the base dataset and queries.
     auto data = svs::data::SimpleData<Eltype, N>::load(test_dataset::data_svs_file());
@@ -494,7 +495,7 @@ CATCH_TEST_CASE("Dynamic MutableVamanaIndex Per-Index Logging Test", "[logging]"
     global_callback_sink->set_level(spdlog::level::trace);
 
     auto original_logger = svs::logging::get();
-    original_logger->sinks().push_back(global_callback_sink);
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
     // Setup index
     auto data = svs::data::SimpleData<Eltype, N>::load(test_dataset::data_svs_file());

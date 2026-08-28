@@ -21,6 +21,7 @@
 #include "svs/lib/timing.h"
 #include "svs/orchestrators/inverted.h"
 #include "tests/utils/inverted_reference.h"
+#include "tests/utils/logging.h"
 #include "tests/utils/test_dataset.h"
 #include <filesystem>
 #include <sstream>
@@ -49,7 +50,7 @@ CATCH_TEST_CASE("InvertedIndex Logging Test", "[long][logging]") {
     );
     global_callback_sink->set_level(spdlog::level::trace);
     auto original_logger = svs::logging::get();
-    original_logger->sinks().push_back(global_callback_sink);
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
     // Setup index
     auto distance = svs::DistanceL2();

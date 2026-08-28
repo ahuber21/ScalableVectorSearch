@@ -18,6 +18,7 @@
 #include "svs/index/inverted/clustering.h"
 
 // tests
+#include "tests/utils/logging.h"
 #include "tests/utils/test_dataset.h"
 #include "tests/utils/utils.h"
 
@@ -414,7 +415,7 @@ CATCH_TEST_CASE("Clustering with Logger", "[logging]") {
     );
     global_callback_sink->set_level(spdlog::level::trace);
     auto original_logger = svs::logging::get();
-    original_logger->sinks().push_back(global_callback_sink);
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
     // Setup cluster
     auto data = svs::data::SimpleData<float>::load(test_dataset::data_svs_file());
