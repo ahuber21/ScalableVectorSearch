@@ -122,3 +122,49 @@ CATCH_TEST_CASE("Simple Graph", "[graphs][simple]") {
         CATCH_REQUIRE(std::equal(s.begin(), s.end(), replacement.begin()));
     }
 }
+
+CATCH_TEST_CASE("try_add_edge", "[graphs][simple]") {
+    using Idx = uint32_t;
+    size_t n_nodes = 5;
+    const size_t max_degree = 3;
+
+    auto graph = svs::graphs::SimpleGraph<Idx>(n_nodes, max_degree);
+
+    // Test 1: Adding a new edge should return Added
+    auto result = graph.try_add_edge(0, 1);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::Added);
+    CATCH_REQUIRE(graph.get_node_degree(0) == 1);
+    CATCH_REQUIRE(graph.has_edge(0, 1));
+
+    // Test 2: Adding an existing edge should return AlreadyExists
+    result = graph.try_add_edge(0, 1);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::AlreadyExists);
+    CATCH_REQUIRE(graph.get_node_degree(0) == 1);
+
+    // Test 3: Self-loop should return AlreadyExists
+    result = graph.try_add_edge(0, 0);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::AlreadyExists);
+    CATCH_REQUIRE(graph.get_node_degree(0) == 1);
+
+    // Test 4: Fill the adjacency list to max_degree
+    result = graph.try_add_edge(0, 2);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::Added);
+    CATCH_REQUIRE(graph.get_node_degree(0) == 2);
+
+    result = graph.try_add_edge(0, 3);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::Added);
+    CATCH_REQUIRE(graph.get_node_degree(0) == 3);
+    CATCH_REQUIRE(graph.get_node_degree(0) == max_degree);
+
+    // Test 5: Adding to a full list should return Full
+    result = graph.try_add_edge(0, 4);
+    CATCH_REQUIRE(result == svs::graphs::AddEdgeResult::Full);
+    CATCH_REQUIRE(graph.get_node_degree(0) == max_degree);
+    CATCH_REQUIRE(!graph.has_edge(0, 4));
+
+    // Test 6: Verify adjacency list integrity after Full
+    auto adjacency = graph.get_node(0);
+    CATCH_REQUIRE(adjacency.size() == max_degree);
+    std::array<Idx, 3> expected{1, 2, 3};
+    CATCH_REQUIRE(std::equal(adjacency.begin(), adjacency.end(), expected.begin()));
+}

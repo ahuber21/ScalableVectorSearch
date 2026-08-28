@@ -29,6 +29,15 @@
 
 namespace svs::graphs {
 
+enum class AddEdgeResult : uint8_t { Added, AlreadyExists, Full };
+
+struct PlainAccess {
+    template <typename T> static T load(const T& value) { return value; }
+    template <typename T> static void store(T& destination, T value) {
+        destination = value;
+    }
+};
+
 //
 // We rely on an implicit layout for the graphs where length is stored inline with the
 // adjacency list like:
@@ -50,7 +59,11 @@ namespace svs::graphs {
 // Base class for packed graphs.
 // Should not be used directly. Rather, one of it's derived classes should be used instead.
 //
-template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGraphBase {
+template <
+    std::unsigned_integral Idx,
+    data::MemoryDataset Data,
+    typename Access = PlainAccess>
+class SimpleGraphBase {
   public:
     using data_type = Data;
 
@@ -103,7 +116,7 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
     const_reference get_node(Idx i) const {
         // Get the raw data.
         std::span<const Idx> raw_data = data_.get_datum(i);
-        auto num_neighbors = raw_data.front();
+        auto num_neighbors = Access::load(raw_data.front());
 
         // Maybe prefetch the rest of the adjacncy list.
         size_t bytes = (1 + num_neighbors) * sizeof(Idx);
@@ -128,7 +141,7 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
     ///
     /// @brief Return the current out degree of vertex ``i``.
     ///
-    size_t get_node_degree(Idx i) const { return data_.get_datum(i).front(); }
+    size_t get_node_degree(Idx i) const { return Access::load(data_.get_datum(i).front()); }
 
     ///
     /// @brief Prefetch the adjacency list for node ``i`` into the L1 cache.
@@ -145,7 +158,7 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
     ///
     void clear_node(Idx i) {
         Idx& num_neighbors = data_.get_datum(i).front();
-        num_neighbors = 0;
+        Access::store(num_neighbors, Idx{0});
     }
 
     ///
@@ -189,11 +202,22 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
         std::span<const Idx> adjusted_neighbors = new_neighbors.first(elements_to_copy);
         value_type adjacency_list = raw_data.subspan(1, elements_to_copy);
 
-        std::copy(
-            adjusted_neighbors.begin(), adjusted_neighbors.end(), adjacency_list.begin()
-        );
-        raw_data.front() = elements_to_copy;
+        for (size_t j = 0; j < elements_to_copy; ++j) {
+            Access::store(adjacency_list[j], adjusted_neighbors[j]);
+        }
+        Access::store(raw_data.front(), elements_to_copy);
     }
+
+    ///
+    /// @brief Attempt to add an edge from vertex ``src`` to vertex ``dst``.
+    ///
+    /// @param src The source vertex.
+    /// @param dst The destination vertex.
+    ///
+    /// @returns Result indicating whether the edge was added, already exists, or the list
+    /// is full.
+    ///
+    AddEdgeResult try_add_edge(Idx src, Idx dst) { return try_add_edge_impl(src, dst); }
 
     ///
     /// @brief Add an edge from vertex ``src`` to vertex ``dst``.
@@ -208,10 +232,18 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
     /// * ``get_node_degree(src) == max_degree()`` (adjacency list is already full)
     /// * ``dst`` is already an out-neighbor of ``src``.
     ///
+    /// Return type is fixed by the graphs::MemoryGraph concept.
+    ///
     size_t add_edge(Idx src, Idx dst) {
+        try_add_edge_impl(src, dst);
+        return get_node_degree(src);
+    }
+
+  private:
+    AddEdgeResult try_add_edge_impl(Idx src, Idx dst) {
         // Don't assign a node as its own neighbor.
         if (src == dst) {
-            return get_node_degree(src);
+            return AddEdgeResult::AlreadyExists;
         }
 
         if constexpr (checkbounds_v) {
@@ -227,9 +259,9 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
 
         // Check if there's room for the new node.
         std::span<Idx> raw_data = data_.get_datum(src);
-        Idx current_size = raw_data.front();
+        Idx current_size = Access::load(raw_data.front());
         if (current_size == max_degree_) {
-            return current_size;
+            return AddEdgeResult::Full;
         }
 
         // At this point, we know there is room.
@@ -248,19 +280,18 @@ template <std::unsigned_integral Idx, data::MemoryDataset Data> class SimpleGrap
         auto it = std::find(begin, end - 1, dst);
         // auto it = std::lower_bound(begin, end - 1, dst);
         if (it != end - 1 && (*it == dst)) {
-            return current_size;
+            return AddEdgeResult::AlreadyExists;
         }
 
         // Insert at the new location.
         std::copy_backward(it, end - 1, end);
-        (*it) = dst;
+        Access::store(*it, dst);
 
-        // // Assign the new edge and update the number of neighbors.
-        // adjacency_list.back() = dst;
-        raw_data.front() = new_size;
-        return new_size;
+        Access::store(raw_data.front(), new_size);
+        return AddEdgeResult::Added;
     }
 
+  public:
     /// Return the maximum out-degree this graph is capable of containing.
     size_t max_degree() const { return max_degree_; }
     /// Return the number of vertices currently in the graph.
@@ -490,5 +521,10 @@ class SimpleBlockedGraph
         return lib::load_from_stream<SimpleBlockedGraph>(is);
     }
 };
+
+static_assert(ImmutableMemoryGraph<SimpleGraph<uint32_t>>);
+static_assert(MemoryGraph<SimpleGraph<uint32_t>>);
+static_assert(ImmutableMemoryGraph<SimpleBlockedGraph<uint32_t>>);
+static_assert(MemoryGraph<SimpleBlockedGraph<uint32_t>>);
 
 } // namespace svs::graphs
