@@ -356,4 +356,53 @@ CATCH_TEST_CASE("Testing Blocked Data", "[core][data][blocked]") {
         graph_data.resize(520);
         CATCH_REQUIRE(vec_data.num_blocks() == graph_data.num_blocks());
     }
+
+    CATCH_SECTION("Segment-stable growth") {
+        size_t blocksize_bytes = 4096;
+        size_t num_elements = 100;
+        size_t dimensions = 5;
+
+        auto parameters = svs::data::BlockingParameters{
+            .blocksize_bytes = svs::lib::prevpow2(blocksize_bytes)};
+        auto allocator =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>(
+                parameters
+            );
+        auto data = svs::data::SimpleData<float, svs::Dynamic, decltype(allocator)>(
+            num_elements, dimensions, allocator
+        );
+
+        static_assert(
+            svs::data::is_blocked_v<decltype(allocator)>,
+            "SegmentStable variant must match is_blocked_v trait"
+        );
+
+        CATCH_REQUIRE(data.size() == num_elements);
+        CATCH_REQUIRE(data.dimensions() == dimensions);
+
+        std::vector<float> values(dimensions);
+        for (size_t i = 0; i < data.size(); ++i) {
+            std::fill(values.begin(), values.end(), static_cast<float>(i));
+            data.set_datum(i, std::span<float>{values.data(), values.size()});
+        }
+
+        std::vector<const float*> pointers_before;
+        for (size_t i = 0; i < data.size(); ++i) {
+            pointers_before.push_back(data.get_datum(i).data());
+        }
+
+        size_t original_size = data.size();
+        data.resize(num_elements + 200);
+
+        for (size_t i = 0; i < original_size; ++i) {
+            CATCH_REQUIRE(data.get_datum(i).data() == pointers_before[i]);
+        }
+
+        for (size_t i = 0; i < original_size; ++i) {
+            auto datum = data.get_datum(i);
+            CATCH_REQUIRE(std::all_of(datum.begin(), datum.end(), [&](float v) {
+                return v == i;
+            }));
+        }
+    }
 }
