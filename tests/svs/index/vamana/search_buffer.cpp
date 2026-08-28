@@ -905,6 +905,38 @@ CATCH_TEST_CASE("MutableBuffer", "[core][search_buffer]") {
             CATCH_REQUIRE(b.next() == make_visited(1, 10.0, true));
             CATCH_REQUIRE(b.done());
         }
+
+        CATCH_SECTION("Sort restores best_unvisited invariant when valid < target") {
+            // Invariant: best_unvisited_ must point to an unvisited candidate after sort().
+            // This tests the 5A path in sort() where valid_ < target_valid_.
+            auto b2 = buffer_type{{10, 20}};
+            CATCH_REQUIRE(b2.target_window() == 10);
+
+            // Add 3 valid candidates with valid_ < target_valid_.
+            b2.push_back({1, 10.0, true});
+            b2.push_back({2, 5.0, true});
+            b2.push_back({3, 8.0, true});
+            CATCH_REQUIRE(b2.size() == 3);
+            CATCH_REQUIRE(b2.valid() == 3);
+            CATCH_REQUIRE(b2.valid() < b2.target_window());
+
+            // Consume first two candidates to mark them visited and advance
+            // best_unvisited_.
+            b2.next(); // Mark [0] visited, best_unvisited_ -> 1
+            b2.next(); // Mark [1] visited, best_unvisited_ -> 2
+            auto best_before = b2.best_unvisited();
+            CATCH_REQUIRE(best_before == 2);
+
+            // Sort reorders buffer. Without the fix, best_unvisited_ stays at stale
+            // position and may point to a visited candidate. With the fix, it's recomputed.
+            b2.sort();
+
+            // Verify invariant: best_unvisited_ points to unvisited candidate or past end.
+            if (b2.best_unvisited() < b2.size()) {
+                // If best_unvisited_ is in bounds, it must be unvisited.
+                CATCH_REQUIRE(!b2[b2.best_unvisited()].visited());
+            }
+        }
     }
 }
 
