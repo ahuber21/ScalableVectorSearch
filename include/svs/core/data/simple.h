@@ -30,6 +30,7 @@
 #include "svs/lib/misc.h"
 #include "svs/lib/prefetch.h"
 #include "svs/lib/saveload.h"
+#include "svs/lib/segmented_vector.h"
 #include "svs/lib/threads.h"
 #include "svs/lib/uuid.h"
 
@@ -659,82 +660,6 @@ struct BlockingParameters {
 
 namespace detail {
 
-// Minimal grow-stable container: appending never relocates existing elements.
-// Added blocks remain at fixed addresses while the dataset grows.
-template <typename T> class SegmentedVector {
-  private:
-    static constexpr size_t segment_size = 64;
-    std::vector<std::unique_ptr<std::array<T, segment_size>>> segments_;
-    size_t size_ = 0;
-
-  public:
-    using reference = T&;
-    using const_reference = const T&;
-
-    SegmentedVector() = default;
-    SegmentedVector(const SegmentedVector&) = delete;
-    SegmentedVector& operator=(const SegmentedVector&) = delete;
-    SegmentedVector(SegmentedVector&&) = default;
-    SegmentedVector& operator=(SegmentedVector&&) = default;
-
-    size_t size() const { return size_; }
-    bool empty() const { return size_ == 0; }
-
-    T& operator[](size_t i) {
-        size_t seg = i / segment_size;
-        size_t off = i % segment_size;
-        return (*segments_[seg])[off];
-    }
-
-    const T& operator[](size_t i) const {
-        size_t seg = i / segment_size;
-        size_t off = i % segment_size;
-        return (*segments_[seg])[off];
-    }
-
-    T& at(size_t i) {
-        if (i >= size_) {
-            throw std::out_of_range("SegmentedVector index out of range");
-        }
-        return (*this)[i];
-    }
-
-    const T& at(size_t i) const {
-        if (i >= size_) {
-            throw std::out_of_range("SegmentedVector index out of range");
-        }
-        return (*this)[i];
-    }
-
-    void push_back(T&& value) {
-        size_t seg = size_ / segment_size;
-        size_t off = size_ % segment_size;
-        if (off == 0) {
-            segments_.push_back(std::make_unique<std::array<T, segment_size>>());
-        }
-        (*segments_[seg])[off] = std::move(value);
-        ++size_;
-    }
-
-    void pop_back() {
-        if (size_ > 0) {
-            --size_;
-            if (size_ % segment_size == 0 && !segments_.empty()) {
-                segments_.pop_back();
-            }
-        }
-    }
-};
-
-} // namespace detail
-} // namespace data
-
-template <typename T>
-inline constexpr bool enable_boundschecking<data::detail::SegmentedVector<T>> = true;
-
-namespace data {
-namespace detail {
-
 // Growth strategy traits: container type and size accessor.
 template <typename Growth> struct BlockedGrowthTraits;
 
@@ -746,7 +671,7 @@ template <> struct BlockedGrowthTraits<Reallocating> {
 };
 
 template <> struct BlockedGrowthTraits<SegmentStable> {
-    template <typename T> using container_type = SegmentedVector<T>;
+    template <typename T> using container_type = lib::SegmentedVector<T>;
 
     // Acquire: paired with release store in write_size. Growth is concurrent with
     // lock-free readers; plain read would be a data race.
