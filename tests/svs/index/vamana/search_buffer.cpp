@@ -15,11 +15,19 @@
  */
 
 // svs
-#include "svs/index/vamana/search_buffer.h"
+// The distance implementations must precede greedy_search.h: its qualified call to
+// distance::compute binds candidates at the definition context, not at instantiation.
+#include "svs/core/data.h"
+#include "svs/core/distance.h"
+#include "svs/core/graph.h"
+
 #include "svs/index/vamana/dynamic_search_buffer.h"
+#include "svs/index/vamana/greedy_search.h"
+#include "svs/index/vamana/search_buffer.h"
 
 // tests
 #include "tests/utils/generators.h"
+#include "tests/utils/test_dataset.h"
 
 // catch2
 #include "catch2/catch_test_macros.hpp"
@@ -30,6 +38,7 @@
 // stdlib
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <type_traits>
 
 namespace vamana = svs::index::vamana;
@@ -929,4 +938,174 @@ CATCH_TEST_CASE("Fuzzing Mutable", "[core][search_buffer]") {
 
     CATCH_SECTION("Less") { run_test(std::less<>()); }
     CATCH_SECTION("Greater") { run_test(std::greater<>()); }
+}
+
+namespace {
+
+struct CountingVisitor {
+    mutable std::set<size_t> invocations;
+    mutable size_t total_calls = 0;
+    template <typename F> void operator()(size_t node_id, F&& body) const {
+        invocations.insert(node_id);
+        ++total_calls;
+        body();
+    }
+};
+
+struct DoubleVisitor {
+    mutable size_t invocations = 0;
+    template <typename F> void operator()(size_t /*node_id*/, F&& body) const {
+        ++invocations;
+        body();
+        body();
+    }
+};
+
+} // namespace
+
+CATCH_TEST_CASE("Node Visitor Concept and Behavior", "[core][greedy_search]") {
+    using namespace svs::index::vamana;
+
+    const auto graph = test_dataset::graph();
+    const auto data = test_dataset::data_f32();
+    const auto queries = test_dataset::queries();
+    constexpr size_t num_queries = 10;
+
+    CATCH_SECTION("Default visitor produces deterministic results") {
+        using buffer_type = SearchBuffer<uint32_t, std::less<>>;
+        auto config = SearchBufferConfig{10, 10};
+        svs::data::GetDatumAccessor accessor{};
+        svs::DistanceL2 distance{};
+
+        std::vector<std::vector<svs::Neighbor<uint32_t>>> baseline_results;
+        baseline_results.reserve(num_queries);
+
+        for (size_t q = 0; q < num_queries; ++q) {
+            auto buffer = buffer_type{config};
+            auto entry_point_span = std::array<uint32_t, 1>{0};
+
+            greedy_search(
+                graph,
+                data,
+                accessor,
+                queries.get_datum(q),
+                distance,
+                buffer,
+                EntryPointInitializer<uint32_t>{entry_point_span}
+            );
+
+            CATCH_REQUIRE(buffer.size() > 0);
+            baseline_results.emplace_back(buffer.view().begin(), buffer.view().end());
+        }
+
+        for (size_t q = 0; q < num_queries; ++q) {
+            auto buffer = buffer_type{config};
+            auto entry_point_span = std::array<uint32_t, 1>{0};
+
+            greedy_search(
+                graph,
+                data,
+                accessor,
+                queries.get_datum(q),
+                distance,
+                buffer,
+                EntryPointInitializer<uint32_t>{entry_point_span}
+            );
+
+            CATCH_REQUIRE(buffer.size() == baseline_results[q].size());
+            for (size_t i = 0; i < buffer.size(); ++i) {
+                CATCH_REQUIRE(buffer[i].id() == baseline_results[q][i].id());
+                CATCH_REQUIRE(buffer[i].distance() == baseline_results[q][i].distance());
+            }
+        }
+    }
+
+    CATCH_SECTION("Double visitor produces identical results to default") {
+        using buffer_type = SearchBuffer<uint32_t, std::less<>>;
+        auto config = SearchBufferConfig{10, 10};
+        auto accessor = svs::data::GetDatumAccessor{};
+        auto distance = svs::DistanceL2{};
+
+        std::vector<std::vector<svs::Neighbor<uint32_t>>> default_results;
+        default_results.reserve(num_queries);
+
+        for (size_t q = 0; q < num_queries; ++q) {
+            auto buffer = buffer_type{config};
+            auto entry_point_span = std::array<uint32_t, 1>{0};
+
+            greedy_search(
+                graph,
+                data,
+                accessor,
+                queries.get_datum(q),
+                distance,
+                buffer,
+                EntryPointInitializer<uint32_t>{entry_point_span},
+                NeighborBuilder{},
+                GreedySearchPrefetchParameters{},
+                svs::lib::Returns(svs::lib::Const<false>()),
+                VisitOnce{}
+            );
+
+            CATCH_REQUIRE(buffer.size() > 0);
+            default_results.emplace_back(buffer.view().begin(), buffer.view().end());
+        }
+
+        for (size_t q = 0; q < num_queries; ++q) {
+            auto buffer = buffer_type{config};
+            auto entry_point_span = std::array<uint32_t, 1>{0};
+            auto double_visitor = DoubleVisitor{};
+
+            greedy_search(
+                graph,
+                data,
+                accessor,
+                queries.get_datum(q),
+                distance,
+                buffer,
+                EntryPointInitializer<uint32_t>{entry_point_span},
+                NeighborBuilder{},
+                GreedySearchPrefetchParameters{},
+                svs::lib::Returns(svs::lib::Const<false>()),
+                double_visitor
+            );
+
+            // Without this the equality check below would also pass if the visitor were
+            // never consulted, making the double-expansion claim vacuous.
+            CATCH_REQUIRE(double_visitor.invocations > 0);
+            CATCH_REQUIRE(buffer.size() == default_results[q].size());
+            for (size_t i = 0; i < buffer.size(); ++i) {
+                CATCH_REQUIRE(buffer[i].id() == default_results[q][i].id());
+                CATCH_REQUIRE(buffer[i].distance() == default_results[q][i].distance());
+            }
+        }
+    }
+
+    CATCH_SECTION("Counting visitor confirms default invokes body once per node") {
+        using buffer_type = SearchBuffer<uint32_t, std::less<>>;
+        auto config = SearchBufferConfig{10, 10};
+        auto accessor = svs::data::GetDatumAccessor{};
+        auto distance = svs::DistanceL2{};
+        auto counting_visitor = CountingVisitor{};
+
+        auto buffer = buffer_type{config};
+        auto entry_point_span = std::array<uint32_t, 1>{0};
+
+        greedy_search(
+            graph,
+            data,
+            accessor,
+            queries.get_datum(0),
+            distance,
+            buffer,
+            EntryPointInitializer<uint32_t>{entry_point_span},
+            NeighborBuilder{},
+            GreedySearchPrefetchParameters{},
+            svs::lib::Returns(svs::lib::Const<false>()),
+            counting_visitor
+        );
+
+        CATCH_REQUIRE(counting_visitor.invocations.size() == counting_visitor.total_calls);
+        CATCH_REQUIRE(counting_visitor.total_calls > 0);
+    }
 }

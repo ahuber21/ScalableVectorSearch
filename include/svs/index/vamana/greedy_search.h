@@ -111,6 +111,21 @@ struct NeighborBuilder {
     }
 };
 
+/// Default visitor that invokes the per-node expansion body exactly once.
+struct VisitOnce {
+    template <typename F> void operator()(size_t /*node_id*/, F&& body) const { body(); }
+};
+
+/// Concept for per-node visitors.
+/// A visitor receives the node ID and a nullary callable body containing the expansion
+/// logic, and may invoke that body one or more times.
+template <typename V>
+concept NodeVisitor = requires(const V& visitor, size_t node_id) {
+                          {
+                              visitor(node_id, [] {})
+                              } -> std::same_as<void>;
+                      };
+
 template <
     graphs::ImmutableMemoryGraph Graph,
     data::ImmutableMemoryDataset Dataset,
@@ -120,7 +135,8 @@ template <
     typename Buffer,
     typename Initializer,
     typename Builder,
-    GreedySearchTracker<typename Graph::index_type> Tracker>
+    GreedySearchTracker<typename Graph::index_type> Tracker,
+    NodeVisitor Visitor = VisitOnce>
 void greedy_search(
     const Graph& graph,
     const Dataset& dataset,
@@ -132,7 +148,9 @@ void greedy_search(
     const Builder& builder,
     Tracker& search_tracker,
     GreedySearchPrefetchParameters prefetch_parameters = {},
-    const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
+    const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>()),
+    // May invoke the body repeatedly; side effects are not reverted between invocations.
+    const Visitor& visit_node = {}
 ) {
     using I = typename Graph::index_type;
 
@@ -159,46 +177,49 @@ void greedy_search(
         const auto& node = search_buffer.next();
         auto node_id = node.id();
 
-        // Get the adjacency list for this vertex and prepare prefetching logic.
-        auto neighbors = graph.get_node(node_id);
-        const size_t num_neighbors = neighbors.size();
-        search_tracker.visited(Neighbor<I>{node}, neighbors.size());
+        visit_node(node_id, [&] {
+            // Get the adjacency list for this vertex and prepare prefetching logic.
+            auto neighbors = graph.get_node(node_id);
+            const size_t num_neighbors = neighbors.size();
+            search_tracker.visited(Neighbor<I>{node}, neighbors.size());
 
-        auto prefetcher = lib::make_prefetcher(
-            lib::PrefetchParameters{
-                prefetch_parameters.lookahead, prefetch_parameters.step},
-            num_neighbors,
-            [&](size_t i) { accessor.prefetch(dataset, neighbors[i]); },
-            [&](size_t i) {
-                // Perform the visited set enabled check just once.
-                if (search_buffer.visited_set_enabled()) {
-                    // Prefetch next bucket so it's (hopefully) in the cache when we next
-                    // consult the visited filter.
-                    if (i + 1 < num_neighbors) {
-                        search_buffer.unsafe_prefetch_visited(neighbors[i + 1]);
+            auto prefetcher = lib::make_prefetcher(
+                lib::PrefetchParameters{
+                    prefetch_parameters.lookahead, prefetch_parameters.step},
+                num_neighbors,
+                [&](size_t i) { accessor.prefetch(dataset, neighbors[i]); },
+                [&](size_t i) {
+                    // Perform the visited set enabled check just once.
+                    if (search_buffer.visited_set_enabled()) {
+                        // Prefetch next bucket so it's (hopefully) in the cache when we
+                        // next consult the visited filter.
+                        if (i + 1 < num_neighbors) {
+                            search_buffer.unsafe_prefetch_visited(neighbors[i + 1]);
+                        }
+                        return !search_buffer.unsafe_is_visited(neighbors[i]);
                     }
-                    return !search_buffer.unsafe_is_visited(neighbors[i]);
+
+                    // Otherwise, always prefetch the next data item.
+                    return true;
+                }
+            );
+
+            ///// Neighbor expansion.
+            prefetcher();
+            for (auto id : neighbors) {
+                if (search_buffer.emplace_visited(id)) {
+                    continue;
                 }
 
-                // Otherwise, always prefetch the next data item.
-                return true;
+                // Run the prefetcher.
+                prefetcher();
+
+                // Compute distance and update search buffer.
+                auto dist =
+                    distance::compute(distance_function, query, accessor(dataset, id));
+                search_buffer.insert(builder(id, dist));
             }
-        );
-
-        ///// Neighbor expansion.
-        prefetcher();
-        for (auto id : neighbors) {
-            if (search_buffer.emplace_visited(id)) {
-                continue;
-            }
-
-            // Run the prefetcher.
-            prefetcher();
-
-            // Compute distance and update search buffer.
-            auto dist = distance::compute(distance_function, query, accessor(dataset, id));
-            search_buffer.insert(builder(id, dist));
-        }
+        });
     }
 }
 
@@ -212,7 +233,8 @@ template <
     distance::Distance<QueryType, typename Dataset::const_value_type> Dist,
     typename Buffer,
     typename Initializer,
-    typename Builder = NeighborBuilder>
+    typename Builder = NeighborBuilder,
+    NodeVisitor Visitor = VisitOnce>
 void greedy_search(
     const Graph& graph,
     const Dataset& dataset,
@@ -223,7 +245,8 @@ void greedy_search(
     const Initializer& initializer,
     const Builder& builder = NeighborBuilder(),
     GreedySearchPrefetchParameters prefetch_parameters = {},
-    const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
+    const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>()),
+    const Visitor& visit_node = {}
 ) {
     auto null_tracker = NullTracker{};
     greedy_search(
@@ -237,7 +260,8 @@ void greedy_search(
         builder,
         null_tracker,
         prefetch_parameters,
-        cancel
+        cancel,
+        visit_node
     );
 }
 } // namespace svs::index::vamana
