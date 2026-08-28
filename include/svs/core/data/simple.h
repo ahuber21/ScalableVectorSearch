@@ -34,6 +34,7 @@
 #include "svs/lib/uuid.h"
 
 // stdlib
+#include <atomic>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -41,8 +42,12 @@
 namespace svs {
 namespace data {
 
+// Growth strategies for blocked storage
+struct Reallocating {};
+struct SegmentStable {};
+
 // Forward declaration for Blocked allocator
-template <typename Alloc> class Blocked;
+template <typename Alloc, typename Growth = Reallocating> class Blocked;
 
 template <size_t M, size_t N> bool check_dims(size_t m, size_t n) {
     if constexpr (M == Dynamic || N == Dynamic) {
@@ -648,7 +653,116 @@ struct BlockingParameters {
     std::optional<lib::PowerOfTwo> blocksize_elements = std::nullopt;
 };
 
-template <typename Alloc> class Blocked : public Alloc {
+/////
+///// Growth strategies implementation
+/////
+
+namespace detail {
+
+// Minimal grow-stable container: appending never relocates existing elements.
+// Added blocks remain at fixed addresses while the dataset grows.
+template <typename T> class SegmentedVector {
+  private:
+    static constexpr size_t segment_size = 64;
+    std::vector<std::unique_ptr<std::array<T, segment_size>>> segments_;
+    size_t size_ = 0;
+
+  public:
+    using reference = T&;
+    using const_reference = const T&;
+
+    SegmentedVector() = default;
+    SegmentedVector(const SegmentedVector&) = delete;
+    SegmentedVector& operator=(const SegmentedVector&) = delete;
+    SegmentedVector(SegmentedVector&&) = default;
+    SegmentedVector& operator=(SegmentedVector&&) = default;
+
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+
+    T& operator[](size_t i) {
+        size_t seg = i / segment_size;
+        size_t off = i % segment_size;
+        return (*segments_[seg])[off];
+    }
+
+    const T& operator[](size_t i) const {
+        size_t seg = i / segment_size;
+        size_t off = i % segment_size;
+        return (*segments_[seg])[off];
+    }
+
+    T& at(size_t i) {
+        if (i >= size_) {
+            throw std::out_of_range("SegmentedVector index out of range");
+        }
+        return (*this)[i];
+    }
+
+    const T& at(size_t i) const {
+        if (i >= size_) {
+            throw std::out_of_range("SegmentedVector index out of range");
+        }
+        return (*this)[i];
+    }
+
+    void push_back(T&& value) {
+        size_t seg = size_ / segment_size;
+        size_t off = size_ % segment_size;
+        if (off == 0) {
+            segments_.push_back(std::make_unique<std::array<T, segment_size>>());
+        }
+        (*segments_[seg])[off] = std::move(value);
+        ++size_;
+    }
+
+    void pop_back() {
+        if (size_ > 0) {
+            --size_;
+            if (size_ % segment_size == 0 && !segments_.empty()) {
+                segments_.pop_back();
+            }
+        }
+    }
+};
+
+} // namespace detail
+} // namespace data
+
+template <typename T>
+inline constexpr bool enable_boundschecking<data::detail::SegmentedVector<T>> = true;
+
+namespace data {
+namespace detail {
+
+// Growth strategy traits: container type and size accessor.
+template <typename Growth> struct BlockedGrowthTraits;
+
+template <> struct BlockedGrowthTraits<Reallocating> {
+    template <typename T> using container_type = std::vector<T>;
+
+    static size_t read_size(const size_t& s) { return s; }
+    static void write_size(size_t& s, size_t value) { s = value; }
+};
+
+template <> struct BlockedGrowthTraits<SegmentStable> {
+    template <typename T> using container_type = SegmentedVector<T>;
+
+    // Acquire: paired with release store in write_size. Growth is concurrent with
+    // lock-free readers; plain read would be a data race.
+    static size_t read_size(const size_t& s) {
+        return std::atomic_ref<const size_t>(s).load(std::memory_order_acquire);
+    }
+
+    // Release: publishing new size must not reorder before the blocks backing it.
+    static void write_size(size_t& s, size_t value) {
+        std::atomic_ref<size_t>(s).store(value, std::memory_order_release);
+    }
+};
+
+} // namespace detail
+
+template <typename Alloc, typename Growth> class Blocked : public Alloc {
   public:
     using allocator_type = Alloc;
     using value_type = typename std::allocator_traits<allocator_type>::value_type;
@@ -666,9 +780,9 @@ template <typename Alloc> class Blocked : public Alloc {
         , parameters_{parameters} {}
 
     // Enable rebinding of allocators.
-    template <typename U> friend class Blocked;
+    template <typename U, typename G> friend class Blocked;
     template <typename U>
-    Blocked(const Blocked<U>& other)
+    Blocked(const Blocked<U, Growth>& other)
         : allocator_type{other.get_allocator()}
         , parameters_{other.parameters_} {}
 
@@ -676,15 +790,17 @@ template <typename Alloc> class Blocked : public Alloc {
     BlockingParameters parameters_{};
 };
 
-template <typename Alloc> inline constexpr bool is_blocked_v = false;
-template <typename Alloc> inline constexpr bool is_blocked_v<Blocked<Alloc>> = true;
+template <typename T> inline constexpr bool is_blocked_v = false;
+template <typename Alloc, typename Growth>
+inline constexpr bool is_blocked_v<Blocked<Alloc, Growth>> = true;
 
 } // namespace data
 
 namespace lib::detail {
 // Allow rebinding of allocators through the Blocked wrapper.
-template <typename To, typename Alloc> struct AllocatorRebinder<To, data::Blocked<Alloc>> {
-    using type = data::Blocked<rebind_allocator_t<To, Alloc>>;
+template <typename To, typename Alloc, typename Growth>
+struct AllocatorRebinder<To, data::Blocked<Alloc, Growth>> {
+    using type = data::Blocked<rebind_allocator_t<To, Alloc>, Growth>;
 };
 } // namespace lib::detail
 
@@ -692,8 +808,11 @@ namespace data {
 ///
 /// @brief A specialization of ``SimpleData`` for large-scale dynamic datasets.
 ///
-template <typename T, size_t Extent, typename Alloc>
-class SimpleData<T, Extent, Blocked<Alloc>> {
+template <typename T, size_t Extent, typename Alloc, typename Growth>
+class SimpleData<T, Extent, Blocked<Alloc, Growth>> {
+  private:
+    using growth_traits = detail::BlockedGrowthTraits<Growth>;
+
   public:
     ///// Static Members
 
@@ -704,7 +823,7 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
 
     // Type Aliases
     using dim_type = std::tuple<size_t, dim_type_t<Extent>>;
-    using allocator_type = Blocked<Alloc>;
+    using allocator_type = Blocked<Alloc, Growth>;
     using inner_allocator_type = Alloc;
     using array_type = DenseArray<T, dim_type, inner_allocator_type>;
 
@@ -716,12 +835,13 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     using value_type = std::span<T, Extent>;
     using const_value_type = std::span<const T, Extent>;
 
-    using lib_alloc_data_type = SimpleData<T, Extent, Blocked<lib::Allocator<T>>>;
+    using lib_alloc_data_type = SimpleData<T, Extent, Blocked<lib::Allocator<T>, Growth>>;
     /// Already blocked, so lib_blocked_alloc_data_type is the same as lib_alloc_data_type.
-    using lib_blocked_alloc_data_type = SimpleData<T, Dynamic, Blocked<lib::Allocator<T>>>;
+    using lib_blocked_alloc_data_type =
+        SimpleData<T, Dynamic, Blocked<lib::Allocator<T>, Growth>>;
 
     ///// Constructors
-    SimpleData(size_t n_elements, size_t n_dimensions, const Blocked<Alloc>& alloc)
+    SimpleData(size_t n_elements, size_t n_dimensions, const Blocked<Alloc, Growth>& alloc)
         : blocksize_{compute_blocksize(alloc, n_dimensions)}
         , blocks_{}
         , dimensions_{n_dimensions}
@@ -729,14 +849,16 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
         , allocator_{alloc} {
         size_t elements_per_block = blocksize_.value();
         size_t num_blocks = lib::div_round_up(n_elements, elements_per_block);
-        blocks_.reserve(num_blocks);
+        if constexpr (std::is_same_v<Growth, Reallocating>) {
+            blocks_.reserve(num_blocks);
+        }
         for (size_t i = 0; i < num_blocks; ++i) {
             add_block();
         }
     }
 
     SimpleData(size_t n_elements, size_t n_dimensions)
-        : SimpleData{n_elements, n_dimensions, Blocked<Alloc>()} {}
+        : SimpleData{n_elements, n_dimensions, Blocked<Alloc, Growth>()} {}
 
     ///
     /// Convert a linear index into an inner-outer index to access the blocked dataset.
@@ -782,10 +904,17 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     /// Add a new data block to the end of the current collection of blocks.
     ///
     void add_block() {
-        blocks_.emplace_back(
-            make_dims(blocksize().value(), lib::forward_extent<Extent>(dimensions())),
-            allocator_.get_allocator()
-        );
+        if constexpr (std::is_same_v<Growth, Reallocating>) {
+            blocks_.emplace_back(
+                make_dims(blocksize().value(), lib::forward_extent<Extent>(dimensions())),
+                allocator_.get_allocator()
+            );
+        } else {
+            blocks_.push_back(array_type(
+                make_dims(blocksize().value(), lib::forward_extent<Extent>(dimensions())),
+                allocator_.get_allocator()
+            ));
+        }
     }
 
     ///
@@ -802,14 +931,12 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     ///
     void resize(size_t new_size) {
         if (new_size > size()) {
-            // Add blocks until there is sufficient capacity.
             while (new_size > capacity()) {
                 add_block();
             }
-            size_ = new_size;
+            growth_traits::write_size(size_, new_size);
         } else if (new_size < size()) {
-            // Reset size then drop blocks until the new size is within the last block.
-            size_ = new_size;
+            growth_traits::write_size(size_, new_size);
             while (capacity() - blocksize().value() > new_size) {
                 drop_block();
             }
@@ -824,7 +951,7 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     ///// Dataset API
     /////
 
-    size_t size() const { return size_; }
+    size_t size() const { return growth_traits::read_size(size_); }
     constexpr size_t dimensions() const {
         if constexpr (Extent != Dynamic) {
             return Extent;
@@ -917,7 +1044,7 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     }
 
     static SimpleData
-    load(const lib::LoadTable& table, const Blocked<Alloc>& allocator = {}) {
+    load(const lib::LoadTable& table, const Blocked<Alloc, Growth>& allocator = {}) {
         return GenericSerializer::load<T>(
             table, lib::Lazy([&allocator](size_t n_elements, size_t n_dimensions) {
                 return SimpleData(n_elements, n_dimensions, allocator);
@@ -928,7 +1055,7 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     static SimpleData load(
         const lib::ContextFreeLoadTable& table,
         std::istream& is,
-        const Blocked<Alloc>& allocator = {}
+        const Blocked<Alloc, Growth>& allocator = {}
     ) {
         return GenericSerializer::load<T>(
             table, is, lib::Lazy([&allocator](size_t n_elements, size_t n_dimensions) {
@@ -938,11 +1065,10 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     }
 
     static SimpleData
-    load(const std::filesystem::path& path, const Blocked<Alloc>& allocator = {}) {
+    load(const std::filesystem::path& path, const Blocked<Alloc, Growth>& allocator = {}) {
         if (detail::is_likely_reload(path)) {
             return lib::load_from_disk<SimpleData>(path, allocator);
         }
-        // Try loading directly.
         return io::auto_load<T>(
             path, lib::Lazy([&allocator](size_t n_elements, size_t n_dimensions) {
                 return SimpleData(n_elements, n_dimensions, allocator);
@@ -951,10 +1077,8 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     }
 
   private:
-    // Helper static function to compute blocksize value.
-    // If blocking parameters have defined blocksize_elements, use it
-    // directly. Otherwise, compute blocksize based on blocksize_bytes.
-    static lib::PowerOfTwo compute_blocksize(const Blocked<Alloc>& alloc, size_t dim) {
+    static lib::PowerOfTwo
+    compute_blocksize(const Blocked<Alloc, Growth>& alloc, size_t dim) {
         if (alloc.parameters().blocksize_elements.has_value()) {
             return alloc.parameters().blocksize_elements.value();
         } else {
@@ -965,16 +1089,19 @@ class SimpleData<T, Extent, Blocked<Alloc>> {
     }
 
   private:
-    // The blocksize in terms of number of vectors.
     lib::PowerOfTwo blocksize_;
-    std::vector<array_type> blocks_;
+    typename growth_traits::template container_type<array_type> blocks_;
     size_t dimensions_;
     size_t size_;
-    Blocked<Alloc> allocator_;
+    Blocked<Alloc, Growth> allocator_;
 };
 
-template <typename T, size_t Extent = Dynamic, typename Alloc = lib::Allocator<T>>
-using BlockedData = SimpleData<T, Extent, Blocked<Alloc>>;
+template <
+    typename T,
+    size_t Extent = Dynamic,
+    typename Alloc = lib::Allocator<T>,
+    typename Growth = Reallocating>
+using BlockedData = SimpleData<T, Extent, Blocked<Alloc, Growth>>;
 
 } // namespace data
 
