@@ -79,7 +79,10 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/lib/saveload.cpp
     ${TEST_DIR}/svs/lib/saveload/load.cpp
     ${TEST_DIR}/svs/lib/scopeguard.cpp
+    ${TEST_DIR}/svs/lib/segmented_vector.cpp
     ${TEST_DIR}/svs/lib/spinlock.cpp
+    ${TEST_DIR}/svs/lib/relocatable_spinlock.cpp
+    ${TEST_DIR}/svs/lib/reverse_edges.cpp
     ${TEST_DIR}/svs/lib/static.cpp
     ${TEST_DIR}/svs/lib/timing.cpp
     ${TEST_DIR}/svs/lib/tuples.cpp
@@ -91,7 +94,9 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/lib/type_traits.cpp
     ${TEST_DIR}/svs/lib/version.cpp
     ${TEST_DIR}/svs/lib/uuid.cpp
+    ${TEST_DIR}/svs/lib/concurrency/atomic_span.cpp
     ${TEST_DIR}/svs/lib/concurrency/readwrite_protected.cpp
+    ${TEST_DIR}/svs/lib/concurrency/seqlock.cpp
     ${TEST_DIR}/svs/lib/avx_detection.cpp
     # Third Party
     ${TEST_DIR}/svs/third-party/fmt.cpp
