@@ -523,7 +523,12 @@ class MultiMutableVamanaIndex {
     // Consolidate only the soft-deleted vectors belonging to `labels`.
     // Vectors soft-deleted under other labels remain navigable until a later
     // consolidate(). Returns the number of external vectors consolidated.
-    template <typename T> size_t consolidate(const T& labels) {
+    template <typename T>
+    size_t consolidate(const T& labels)
+        requires requires(ParentIndex& parent, std::vector<external_id_type>& e) {
+                     parent.consolidate(e);
+                 }
+    {
         std::vector<external_id_type> externals;
         {
             std::lock_guard l2e_lock{l2e_mutex_};
@@ -536,12 +541,7 @@ class MultiMutableVamanaIndex {
                 pending_deletes_.erase(it);
             }
         }
-        if constexpr (requires { index_->consolidate(externals); }) {
-            return index_->consolidate(externals);
-        } else {
-            // Parent index does not yet support partial consolidation.
-            return externals.size();
-        }
+        return index_->consolidate(externals);
     }
 
     template <typename QueryType>
