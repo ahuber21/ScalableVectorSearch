@@ -425,14 +425,25 @@ struct VamanaSingleSearchType {
     }
 };
 
-/// In rare cases, the search buffer may not be filled with enough results.
-/// This can occur in dynamic indexes when many vectors have been deleted
-/// and the graph becomes sparsely connected. It's a corner case and should
-/// not happen frequently, but when it does, we may need to supplement the buffer
-/// with additional results.
+struct CheckAndSupplementSearchBufferType {
+    /// Overridable per index for search-buffer supplementation when graph traversal yields
+    /// insufficient results. Default scans all external IDs.
+    template <typename Index, typename SearchBuffer, typename Query>
+    void
+    operator()(const Index& index, SearchBuffer& search_buffer, const Query& query) const {
+        svs::svs_invoke(*this, index, search_buffer, query);
+    }
+};
+
+/// Customization point for supplementing under-filled search buffers.
+inline constexpr CheckAndSupplementSearchBufferType check_and_supplement_search_buffer{};
+
 template <typename Index, typename SearchBuffer, typename Query>
-void check_and_supplement_search_buffer(
-    const Index& index, SearchBuffer& search_buffer, const Query& query
+void svs_invoke(
+    svs::tag_t<check_and_supplement_search_buffer>,
+    const Index& index,
+    SearchBuffer& search_buffer,
+    const Query& query
 ) {
     if (search_buffer.valid() < search_buffer.target_window() &&
         search_buffer.valid() < index.size()) {
