@@ -87,4 +87,44 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
         // Ensure that all non-deleted nodes only have non-deleted neighbors.
         check_post_conditions(graph, predicate);
     }
+
+    CATCH_SECTION("SeqlockAccess graph consolidation") {
+        using SeqlockGraph = svs::graphs::SimpleGraphBase<
+            uint32_t,
+            svs::data::SimpleData<uint32_t, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+
+        auto plain_graph = test_dataset::graph();
+        SeqlockGraph seqlock_graph(plain_graph.n_nodes(), plain_graph.max_degree());
+
+        for (size_t i = 0; i < plain_graph.n_nodes(); ++i) {
+            const auto& neighbors = plain_graph.get_node(i);
+            std::vector<uint32_t> neighbor_vec(neighbors.begin(), neighbors.end());
+            seqlock_graph.replace_node(i, neighbor_vec);
+        }
+
+        auto predicate = [](const auto& i) { return (i % 10) == 0; };
+        svs::distance::DistanceL2 distance{};
+
+        svs::index::vamana::consolidate(
+            seqlock_graph,
+            data,
+            threadpool,
+            seqlock_graph.max_degree(),
+            750,
+            1.2,
+            distance,
+            predicate
+        );
+
+        check_post_conditions(seqlock_graph, predicate);
+
+        size_t total_edges = 0;
+        for (size_t i = 0; i < seqlock_graph.n_nodes(); ++i) {
+            const auto& neighbors = seqlock_graph.get_node(i);
+            total_edges += neighbors.size();
+            CATCH_REQUIRE(neighbors.size() <= seqlock_graph.max_degree());
+        }
+        CATCH_REQUIRE(total_edges > 0);
+    }
 }
