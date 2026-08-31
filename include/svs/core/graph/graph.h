@@ -23,6 +23,7 @@
 #include "svs/lib/concurrency/atomic_span.h"
 #include "svs/lib/concurrency/seqlock.h"
 #include "svs/lib/relocatable_spinlock.h"
+#include "svs/lib/reverse_edges.h"
 #include "svs/lib/saveload.h"
 #include "svs/lib/segmented_vector.h"
 
@@ -49,6 +50,7 @@ struct PlainAccess {
     }
 
     template <typename Idx> using span_type = std::span<const Idx>;
+    template <typename Idx> using reverse_edges_type = lib::NoReverseEdges;
 };
 
 struct SeqlockAccess {
@@ -71,6 +73,7 @@ struct SeqlockAccess {
     }
 
     template <typename Idx> using span_type = AtomicSpan<const Idx>;
+    template <typename Idx> using reverse_edges_type = lib::ReverseEdges<Idx>;
 };
 
 //
@@ -165,6 +168,7 @@ class SimpleGraphBase {
         : data_{num_nodes, max_degree + 1}
         , max_degree_{lib::narrow<Idx>(max_degree)} {
         access_state_.resize(num_nodes);
+        reverse_edges_.resize(num_nodes);
         reset();
     }
 
@@ -176,6 +180,7 @@ class SimpleGraphBase {
         : data_{num_nodes, max_degree + 1, allocator}
         , max_degree_{lib::narrow<Idx>(max_degree)} {
         access_state_.resize(num_nodes);
+        reverse_edges_.resize(num_nodes);
         reset();
     }
 
@@ -183,6 +188,7 @@ class SimpleGraphBase {
         : data_{std::move(data)}
         , max_degree_{lib::narrow<Idx>(data_.dimensions() - 1)} {
         access_state_.resize(data_.size());
+        reverse_edges_.resize(data_.size());
     }
 
     const_reference raw_row(Idx i) const { return data_.get_datum(i); }
@@ -284,6 +290,7 @@ class SimpleGraphBase {
     void clear_node(Idx i) {
         Idx& num_neighbors = data_.get_datum(i).front();
         Access::store(num_neighbors, Idx{0});
+        reverse_edges_.reset_node(i);
     }
 
     ///
@@ -293,6 +300,7 @@ class SimpleGraphBase {
         for (size_t i = 0; i < n_nodes(); ++i) {
             clear_node(i);
         }
+        reverse_edges_.reset();
     }
 
     ///
@@ -327,9 +335,25 @@ class SimpleGraphBase {
         std::span<const Idx> adjusted_neighbors = new_neighbors.first(elements_to_copy);
         value_type adjacency_list = raw_data.subspan(1, elements_to_copy);
 
+        bool recording = reverse_edges_.is_recording();
+
+        // Remove old reverse edges before overwriting adjacency list.
+        if (recording) {
+            Idx old_size = Access::load(raw_data.front());
+            for (Idx j = 0; j < old_size; ++j) {
+                Idx old_dst = Access::load(raw_data[1 + j]);
+                reverse_edges_.remove_unchecked(i, old_dst);
+            }
+        }
+
+        // Store new adjacency list and record reverse edges.
         for (size_t j = 0; j < elements_to_copy; ++j) {
             Access::store(adjacency_list[j], adjusted_neighbors[j]);
+            if (recording) {
+                reverse_edges_.record_unchecked(i, adjusted_neighbors[j]);
+            }
         }
+
         // Store the new size AFTER storing all entries to prevent torn reads.
         // A reader clamping size to max_degree_ ensures it never reads uninitialised data.
         Access::store(raw_data.front(), elements_to_copy);
@@ -415,6 +439,7 @@ class SimpleGraphBase {
         Access::store(*it, dst);
 
         Access::store(raw_data.front(), new_size);
+        reverse_edges_.record(src, dst);
         return AddEdgeResult::Added;
     }
 
@@ -431,8 +456,25 @@ class SimpleGraphBase {
     void unsafe_resize(size_t new_size) {
         data_.resize(new_size);
         access_state_.resize(new_size);
+        reverse_edges_.resize(new_size);
     }
     void add_node() { unsafe_resize(n_nodes() + 1); }
+
+    lib::ReverseEdges<Idx>* reverse_edges()
+        requires(!std::same_as<
+                 typename Access::template reverse_edges_type<Idx>,
+                 lib::NoReverseEdges>)
+    {
+        return &reverse_edges_;
+    }
+
+    const lib::ReverseEdges<Idx>* reverse_edges() const
+        requires(!std::same_as<
+                 typename Access::template reverse_edges_type<Idx>,
+                 lib::NoReverseEdges>)
+    {
+        return &reverse_edges_;
+    }
 
     ///// Saving
     static constexpr lib::Version save_version = lib::Version(0, 0, 0);
@@ -532,6 +574,7 @@ class SimpleGraphBase {
     data_type data_;
     Idx max_degree_;
     [[no_unique_address]] typename Access::state_type access_state_;
+    [[no_unique_address]] typename Access::template reverse_edges_type<Idx> reverse_edges_;
 };
 
 /////

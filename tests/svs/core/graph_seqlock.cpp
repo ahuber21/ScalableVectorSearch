@@ -19,12 +19,16 @@
 #include "svs/core/graph/graph.h"
 #include "svs/index/vamana/greedy_search.h"
 #include "svs/index/vamana/sync_policy.h"
+#include "svs/lib/reverse_edges.h"
 
 // test utils
 #include "tests/utils/utils.h"
 
 // catch2
 #include "catch2/catch_test_macros.hpp"
+
+// external
+#include "tsl/robin_set.h"
 
 // stdlib
 #include <algorithm>
@@ -112,6 +116,10 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock]") {
     constexpr Idx test_node = 50;
 
     SeqlockGraph graph(n_nodes, max_degree);
+
+    // Reader starvation from reverse-edge maintenance inside write guards obscures the
+    // actual seqlock read/validate protocol test.
+    graph.reverse_edges()->set_recording(false);
 
     // Two distinct valid states for the test node
     std::vector<Idx> state_a;
@@ -307,5 +315,157 @@ CATCH_TEST_CASE("Seqlock access control negative test", "[graphs][seqlock]") {
 
         bool validated = graph.read_validate(test_node, seq_opt.value());
         CATCH_REQUIRE(validated);
+    }
+}
+
+CATCH_TEST_CASE("Reverse edges compile-time dispatch", "[graphs][seqlock]") {
+    using Idx = uint32_t;
+    using PlainGraph =
+        svs::graphs::SimpleGraphBase<Idx, svs::data::SimpleData<Idx, svs::Dynamic>>;
+    using SeqlockGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::SeqlockAccess>;
+
+    CATCH_SECTION("NoReverseEdges is empty") {
+        static_assert(std::is_empty_v<svs::lib::NoReverseEdges>);
+    }
+
+    CATCH_SECTION("Plain graph reverse_edges_type is empty") {
+        static_assert(std::is_empty_v<svs::graphs::PlainAccess::reverse_edges_type<Idx>>);
+        [[maybe_unused]] PlainGraph plain(10, 5);
+    }
+
+    CATCH_SECTION("Both graph types are move-constructible") {
+        static_assert(std::is_move_constructible_v<PlainGraph>);
+        static_assert(std::is_move_constructible_v<SeqlockGraph>);
+        static_assert(std::is_move_assignable_v<PlainGraph>);
+        static_assert(std::is_move_assignable_v<SeqlockGraph>);
+    }
+
+    CATCH_SECTION("Seqlock graph has reverse_edges accessor") {
+        static_assert(requires(SeqlockGraph & g) {
+                          {
+                              g.reverse_edges()
+                              } -> std::convertible_to<svs::lib::ReverseEdges<Idx>*>;
+                      });
+        static_assert(requires(const SeqlockGraph& g) {
+                          {
+                              g.reverse_edges()
+                              } -> std::convertible_to<const svs::lib::ReverseEdges<Idx>*>;
+                      });
+    }
+
+    CATCH_SECTION("Recording enabled by default") {
+        constexpr size_t n_nodes = 10;
+        constexpr size_t max_degree = 8;
+        SeqlockGraph graph(n_nodes, max_degree);
+
+        graph.add_edge(0, 5);
+        graph.add_edge(1, 5);
+
+        auto* rev_edges = graph.reverse_edges();
+        tsl::robin_set<size_t> in_neighbors_5;
+        rev_edges->collect(5, in_neighbors_5, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_5.size() == 2);
+        CATCH_REQUIRE(in_neighbors_5.count(0) == 1);
+        CATCH_REQUIRE(in_neighbors_5.count(1) == 1);
+    }
+
+    CATCH_SECTION("Functional behavior on seqlock graph") {
+        constexpr size_t n_nodes = 10;
+        constexpr size_t max_degree = 8;
+        SeqlockGraph graph(n_nodes, max_degree);
+
+        auto* rev_edges = graph.reverse_edges();
+        CATCH_REQUIRE(rev_edges != nullptr);
+
+        graph.add_edge(0, 5);
+        graph.add_edge(1, 5);
+        graph.add_edge(2, 5);
+        graph.add_edge(3, 7);
+        graph.add_edge(5, 7);
+
+        tsl::robin_set<size_t> in_neighbors_5;
+        rev_edges->collect(5, in_neighbors_5, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_5.size() == 3);
+        CATCH_REQUIRE(in_neighbors_5.count(0) == 1);
+        CATCH_REQUIRE(in_neighbors_5.count(1) == 1);
+        CATCH_REQUIRE(in_neighbors_5.count(2) == 1);
+
+        tsl::robin_set<size_t> in_neighbors_7;
+        rev_edges->collect(7, in_neighbors_7, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_7.size() == 2);
+        CATCH_REQUIRE(in_neighbors_7.count(3) == 1);
+        CATCH_REQUIRE(in_neighbors_7.count(5) == 1);
+
+        tsl::robin_set<size_t> in_neighbors_0;
+        rev_edges->collect(0, in_neighbors_0, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_0.empty());
+    }
+
+    CATCH_SECTION("clear_node un-records edges") {
+        constexpr size_t n_nodes = 10;
+        constexpr size_t max_degree = 8;
+        SeqlockGraph graph(n_nodes, max_degree);
+
+        auto* rev_edges = graph.reverse_edges();
+
+        graph.add_edge(0, 5);
+        graph.add_edge(1, 5);
+        graph.add_edge(2, 5);
+
+        tsl::robin_set<size_t> in_neighbors;
+        rev_edges->collect(5, in_neighbors, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors.size() == 3);
+
+        graph.clear_node(5);
+
+        in_neighbors.clear();
+        rev_edges->collect(5, in_neighbors, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors.empty());
+    }
+
+    CATCH_SECTION("replace_node records new edges") {
+        constexpr size_t n_nodes = 10;
+        constexpr size_t max_degree = 8;
+        SeqlockGraph graph(n_nodes, max_degree);
+
+        auto* rev_edges = graph.reverse_edges();
+
+        std::vector<Idx> neighbors = {1, 3, 5, 7};
+        graph.replace_node(0, neighbors);
+
+        for (Idx n : neighbors) {
+            tsl::robin_set<size_t> in_neighbors;
+            rev_edges->collect(n, in_neighbors, [](Idx) { return false; });
+            CATCH_REQUIRE(in_neighbors.count(0) >= 1);
+        }
+    }
+
+    CATCH_SECTION("replace_node removes old edges") {
+        constexpr size_t n_nodes = 10;
+        constexpr size_t max_degree = 8;
+        SeqlockGraph graph(n_nodes, max_degree);
+
+        auto* rev_edges = graph.reverse_edges();
+
+        std::vector<Idx> old_neighbors = {1, 2, 3};
+        graph.replace_node(0, old_neighbors);
+
+        tsl::robin_set<size_t> in_neighbors_2;
+        rev_edges->collect(2, in_neighbors_2, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_2.count(0) == 1);
+
+        std::vector<Idx> new_neighbors = {4, 5, 6};
+        graph.replace_node(0, new_neighbors);
+
+        in_neighbors_2.clear();
+        rev_edges->collect(2, in_neighbors_2, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_2.count(0) == 0);
+
+        tsl::robin_set<size_t> in_neighbors_5;
+        rev_edges->collect(5, in_neighbors_5, [](Idx) { return false; });
+        CATCH_REQUIRE(in_neighbors_5.count(0) == 1);
     }
 }
