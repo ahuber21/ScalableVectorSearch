@@ -45,15 +45,11 @@ template <typename Compressed> float decompress(Compressed val, float scale, flo
     return scale * float(val) + bias;
 }
 
-// Used to SFINAE away resizing methods if the allocator is not blocked.
-template <typename A> inline constexpr bool is_blocked = false;
-template <typename A> inline constexpr bool is_blocked<data::Blocked<A>> = true;
-
 } // namespace detail
 
 // Trait to determine if an allocator is blocked or not.
 template <typename A>
-concept is_resizeable = detail::is_blocked<A>;
+concept is_resizeable = data::is_blocked_v<A>;
 
 template <typename ElementType> class EuclideanCompressed {
   public:

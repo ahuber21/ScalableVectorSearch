@@ -33,6 +33,13 @@
 
 namespace scalar = svs::quantization::scalar;
 
+// Regression test for is_resizeable with SegmentStable growth strategy
+static_assert(scalar::is_resizeable<
+              svs::data::Blocked<std::allocator<float>, svs::data::Reallocating>>);
+static_assert(scalar::is_resizeable<
+              svs::data::Blocked<std::allocator<float>, svs::data::SegmentStable>>);
+static_assert(!scalar::is_resizeable<std::allocator<float>>);
+
 template <typename T, size_t N> void test_sq_top() {
     // First, construct an online compression.
     auto original = svs::data::SimpleData<float, N>::load(test_dataset::data_svs_file());
