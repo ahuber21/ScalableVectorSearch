@@ -70,7 +70,7 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
         // The partial consolidation operator() should not be callable for SimpleGraph.
         using Graph = decltype(graph);
 
-        CATCH_REQUIRE(!HasReverseEdges<Graph>);
+        static_assert(!HasReverseEdges<Graph>);
     }
 
     CATCH_SECTION("Remove Even Nodes") {

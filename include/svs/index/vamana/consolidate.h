@@ -31,7 +31,6 @@
 #include "tsl/robin_set.h"
 
 // stdlib
-#include <numeric>
 #include <span>
 #include <unordered_set>
 
@@ -234,6 +233,7 @@ class GraphConsolidator {
     template <typename GlobalIds, typename Deleted>
     void generate_updates(
         const GlobalIds& global_ids,
+        size_t offset,
         const threads::UnitRange<size_t>& local_ids,
         BulkUpdate<I>& update_buffer,
         ConsolidateThreadLocal<I>& tls,
@@ -247,7 +247,7 @@ class GraphConsolidator {
         auto&& general_distance = build_adaptor.general_distance();
 
         for (auto i : local_ids) {
-            size_t src = global_ids[i];
+            size_t src = global_ids[offset + i];
 
             if (is_deleted(src)) {
                 continue;
@@ -297,11 +297,12 @@ class GraphConsolidator {
     void apply_updates(
         BulkUpdate<I>& update_buffer,
         const GlobalIds& global_ids,
+        size_t offset,
         const threads::UnitRange<size_t>& local_ids
     ) {
         for (auto i : local_ids) {
             if (update_buffer.needs_update(i)) {
-                graph_.replace_node(global_ids[i], update_buffer.get_update(i));
+                graph_.replace_node(global_ids[offset + i], update_buffer.get_update(i));
             }
         }
     }
@@ -323,9 +324,8 @@ class GraphConsolidator {
         size_t start = 0;
         while (start < num_work) {
             size_t stop = std::min(num_work, start + update_batch_size);
-            auto global_ids =
-                std::span<const size_t>(work_ids).subspan(start, stop - start);
-            threads::UnitRange<size_t> local_range{0, global_ids.size()};
+            size_t batch_size = stop - start;
+            threads::UnitRange<size_t> local_range{0, batch_size};
 
             update_buffer.prepare();
             threads::parallel_for(
@@ -334,7 +334,8 @@ class GraphConsolidator {
                 [&](const auto& local_ids, uint64_t tid) {
                     auto& thread_local_scratch = tls.at(tid);
                     generate_updates(
-                        global_ids,
+                        work_ids,
+                        start,
                         threads::UnitRange(local_ids),
                         update_buffer,
                         thread_local_scratch,
@@ -347,7 +348,9 @@ class GraphConsolidator {
                 threadpool_,
                 threads::DynamicPartition{local_range, thread_batch_size},
                 [&](const auto& local_ids, uint64_t /*tid*/) {
-                    apply_updates(update_buffer, global_ids, threads::UnitRange(local_ids));
+                    apply_updates(
+                        update_buffer, work_ids, start, threads::UnitRange(local_ids)
+                    );
                 }
             );
 
@@ -358,8 +361,7 @@ class GraphConsolidator {
   public:
     template <typename Deleted> void operator()(const Deleted& is_deleted) {
         const size_t num_nodes = graph_.n_nodes();
-        std::vector<size_t> all_ids(num_nodes);
-        std::iota(all_ids.begin(), all_ids.end(), size_t{0});
+        threads::UnitRange<size_t> all_ids{0, num_nodes};
         run_driver(all_ids, is_deleted);
     }
 
