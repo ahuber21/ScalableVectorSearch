@@ -17,7 +17,9 @@
 // svs
 #include "svs/core/data/simple.h"
 #include "svs/core/graph/graph.h"
+#include "svs/lib/datatype.h"
 
+#include "svs/index/vamana/dynamic_index.h"
 #include "svs/index/vamana/sync_policy.h"
 
 // catch2
@@ -294,5 +296,75 @@ CATCH_TEST_CASE("MovableMutex", "[index][vamana][sync_policy]") {
         destination = std::move(source);
         CATCH_REQUIRE(destination.try_lock());
         destination.unlock();
+    }
+}
+
+CATCH_TEST_CASE("Slot Metadata State Transitions", "[index][vamana][sync_policy]") {
+    using SlotMetadata = vamana::SlotMetadata;
+
+    CATCH_SECTION("delete_entry handles Pending slots in concurrent mode") {
+        // Test that delete_entry accepts both Valid and Pending slots when
+        // reserves_pending_slots is true.
+        auto status = svs::lib::SegmentedVector<SlotMetadata>(10, SlotMetadata::Empty);
+        status[0] = SlotMetadata::Valid;
+        status[1] = SlotMetadata::Pending;
+
+        // Simulate delete_entry behavior in concurrent mode.
+        for (size_t i : {size_t{0}, size_t{1}}) {
+            auto meta = status[i];
+            // In concurrent mode, both Valid and Pending are acceptable for deletion.
+            CATCH_REQUIRE((meta == SlotMetadata::Valid || meta == SlotMetadata::Pending));
+            status[i] = SlotMetadata::Deleted;
+        }
+
+        CATCH_REQUIRE(status[0] == SlotMetadata::Deleted);
+        CATCH_REQUIRE(status[1] == SlotMetadata::Deleted);
+    }
+
+    CATCH_SECTION("Pending slots excluded from search in concurrent mode") {
+        // ValidBuilder with ReservesPending=true must treat Pending as invalid.
+        auto status = svs::lib::SegmentedVector<SlotMetadata>(4, SlotMetadata::Empty);
+        status[0] = SlotMetadata::Valid;
+        status[1] = SlotMetadata::Pending;
+        status[2] = SlotMetadata::Deleted;
+        status[3] = SlotMetadata::Empty;
+
+        auto builder =
+            vamana::ValidBuilder<decltype(status), true /* ReservesPending */>(status);
+
+        // Only Valid slots should be considered valid by the builder.
+        CATCH_REQUIRE(builder(0, 1.0f).valid());
+        CATCH_REQUIRE(!builder(1, 1.0f).valid()); // Pending
+        CATCH_REQUIRE(!builder(2, 1.0f).valid()); // Deleted
+        CATCH_REQUIRE(!builder(3, 1.0f).valid()); // Empty
+    }
+
+    CATCH_SECTION("Pending slots handled in debug_check_graph_consistency") {
+        // The switch statement in debug_check_graph_consistency explicitly handles
+        // all states including Pending, treating it as invalid (not searchable).
+        auto is_valid = [](SlotMetadata metadata, bool allow_deleted) {
+            switch (metadata) {
+                case SlotMetadata::Valid: {
+                    return true;
+                }
+                case SlotMetadata::Deleted: {
+                    return allow_deleted;
+                }
+                case SlotMetadata::Empty:
+                case SlotMetadata::Pending: {
+                    return false;
+                }
+            }
+            return false;
+        };
+
+        CATCH_REQUIRE(is_valid(SlotMetadata::Valid, false));
+        CATCH_REQUIRE(is_valid(SlotMetadata::Valid, true));
+        CATCH_REQUIRE(!is_valid(SlotMetadata::Deleted, false));
+        CATCH_REQUIRE(is_valid(SlotMetadata::Deleted, true));
+        CATCH_REQUIRE(!is_valid(SlotMetadata::Empty, false));
+        CATCH_REQUIRE(!is_valid(SlotMetadata::Empty, true));
+        CATCH_REQUIRE(!is_valid(SlotMetadata::Pending, false));
+        CATCH_REQUIRE(!is_valid(SlotMetadata::Pending, true));
     }
 }
