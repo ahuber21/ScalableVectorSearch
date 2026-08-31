@@ -385,6 +385,15 @@ namespace {
 template <typename Graph, typename Data, typename Sync> void test_locking_impl() {
     const size_t num_threads = 2;
     using Distance = svs::distance::DistanceL2;
+    using Index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Distance, Sync>;
+
+    static_assert(std::is_same_v<
+                  decltype(std::declval<const Index&>().lock_for_search()),
+                  std::shared_lock<typename Sync::mutex_type>>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<const Index&>().lock_for_translation()),
+                  std::shared_lock<typename Sync::mutex_type>>);
+
     auto source_data = test_dataset::data_f32();
     auto data = Data(source_data.size(), source_data.dimensions());
     for (size_t i = 0; i < source_data.size(); ++i) {
@@ -394,18 +403,16 @@ template <typename Graph, typename Data, typename Sync> void test_locking_impl()
     std::iota(indices.begin(), indices.end(), 0);
 
     svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
-    auto index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Distance, Sync>(
-        parameters, std::move(data), indices, Distance(), num_threads
-    );
+    auto index = Index(parameters, std::move(data), indices, Distance(), num_threads);
 
     {
         auto lock = index.lock_for_search();
-        CATCH_REQUIRE(true);
+        CATCH_REQUIRE(lock.owns_lock());
     }
 
     {
         auto lock = index.lock_for_translation();
-        CATCH_REQUIRE(true);
+        CATCH_REQUIRE(lock.owns_lock());
     }
 
     const size_t num_neighbors = 10;
@@ -447,8 +454,12 @@ template <typename Graph, typename Data, typename Sync> void test_locking_impl()
 
 CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
     using SeqSync = svs::index::vamana::SequentialSync;
-    static_assert(std::is_empty_v<SeqSync::mutex_type>, "NullMutex must be empty");
-    static_assert(std::is_empty_v<svs::lib::NullMutex>, "NullMutex must be empty");
+    using SeqlockSync = svs::index::vamana::SeqlockSync;
+
+    static_assert(std::is_empty_v<SeqSync::mutex_type>);
+    static_assert(std::is_empty_v<svs::lib::NullMutex>);
+    static_assert(!std::is_empty_v<SeqlockSync::mutex_type>);
+    static_assert(!std::is_empty_v<svs::lib::MovableMutex<std::shared_mutex>>);
 
     CATCH_SECTION("SequentialSync") {
         using Graph = svs::graphs::SimpleBlockedGraph<uint32_t>;
@@ -458,7 +469,6 @@ CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
 
     CATCH_SECTION("SeqlockSync") {
         using Idx = uint32_t;
-        using SeqlockSync = svs::index::vamana::SeqlockSync;
         using Graph = svs::graphs::SimpleGraphBase<
             Idx,
             svs::data::SimpleData<Idx, svs::Dynamic>,
@@ -513,6 +523,16 @@ CATCH_TEST_CASE(
 ) {
     using Idx = uint32_t;
     using Distance = svs::distance::DistanceL2;
+
+    using SeqSync = svs::index::vamana::SequentialSync;
+    using SeqGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::PlainAccess>;
+    using SeqData = svs::data::SimpleData<float, svs::Dynamic>;
+    using SeqIndex =
+        svs::index::vamana::MutableVamanaIndex<SeqGraph, SeqData, Distance, SeqSync>;
+
     using SeqlockSync = svs::index::vamana::SeqlockSync;
     using SeqlockGraph = svs::graphs::SimpleGraphBase<
         Idx,
@@ -525,66 +545,117 @@ CATCH_TEST_CASE(
     static_assert(std::is_move_constructible_v<SeqlockIndex>);
 
     const size_t num_threads = 2;
-    auto data = test_dataset::data_f32();
-    const size_t initial_size = data.size();
+    const size_t num_neighbors = 10;
+    auto queries = test_dataset::queries();
+    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
+    auto search_params = svs::index::vamana::VamanaSearchParameters{};
+    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
+
+    auto data_seq = test_dataset::data_f32();
+    auto data_seqlock = test_dataset::data_f32();
+    const size_t initial_size = data_seq.size();
     std::vector<size_t> indices(initial_size);
     std::iota(indices.begin(), indices.end(), 0);
 
-    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
-    auto index =
-        SeqlockIndex(parameters, std::move(data), indices, Distance(), num_threads);
+    auto seq_index =
+        SeqIndex(parameters, std::move(data_seq), indices, Distance(), num_threads);
+    auto seqlock_index =
+        SeqlockIndex(parameters, std::move(data_seqlock), indices, Distance(), num_threads);
 
-    CATCH_REQUIRE(index.size() == initial_size);
+    CATCH_REQUIRE(seq_index.size() == initial_size);
+    CATCH_REQUIRE(seqlock_index.size() == initial_size);
 
-    const size_t num_neighbors = 10;
-    auto queries = test_dataset::queries();
+    auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+    auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
     auto groundtruth = test_dataset::groundtruth_euclidean();
-    auto search_params = svs::index::vamana::VamanaSearchParameters{};
-    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
-    auto results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
-    index.search(results.view(), queries.cview(), search_params);
 
-    auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
-    CATCH_REQUIRE(recall > 0.0);
+    auto compare_results = [&](const char* stage) {
+        auto seq_recall =
+            svs::k_recall_at_n(groundtruth, seq_results, num_neighbors, num_neighbors);
+        auto seqlock_recall =
+            svs::k_recall_at_n(groundtruth, seqlock_results, num_neighbors, num_neighbors);
+
+        size_t differing_queries = 0;
+        size_t total_mismatches = 0;
+        for (size_t q = 0; q < queries.size(); ++q) {
+            bool query_differs = false;
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                if (seqlock_results.index(q, i) != seq_results.index(q, i)) {
+                    ++total_mismatches;
+                    query_differs = true;
+                }
+            }
+            if (query_differs) {
+                ++differing_queries;
+            }
+        }
+
+        if (total_mismatches > 0) {
+            CATCH_WARN(
+                stage << ": SeqlockSync diverges from SequentialSync: " << differing_queries
+                      << "/" << queries.size() << " queries differ, " << total_mismatches
+                      << " total mismatches. "
+                      << "Sequential recall: " << seq_recall
+                      << ", Seqlock recall: " << seqlock_recall
+            );
+        }
+        CATCH_REQUIRE(seq_recall > 0.0);
+        CATCH_REQUIRE(seqlock_recall > 0.0);
+    };
+
+    seq_index.search(seq_results.view(), queries.cview(), search_params);
+    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+    compare_results("Initial build");
 
     const size_t num_to_add = 5;
-    auto points_to_add =
-        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, index.dimensions());
+    auto points_seq =
+        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seq_index.dimensions());
+    auto points_seqlock =
+        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seqlock_index.dimensions());
     for (size_t i = 0; i < num_to_add; ++i) {
-        std::vector<float> datum(index.dimensions());
-        for (size_t j = 0; j < index.dimensions(); ++j) {
+        std::vector<float> datum(seq_index.dimensions());
+        for (size_t j = 0; j < seq_index.dimensions(); ++j) {
             datum[j] = static_cast<float>(i + j);
         }
-        points_to_add.set_datum(i, datum);
+        points_seq.set_datum(i, datum);
+        points_seqlock.set_datum(i, datum);
     }
     std::vector<size_t> new_ids(num_to_add);
     std::iota(new_ids.begin(), new_ids.end(), initial_size);
 
-    index.add_points(points_to_add, new_ids);
-    CATCH_REQUIRE(index.size() == initial_size + num_to_add);
+    seq_index.add_points(points_seq, new_ids);
+    seqlock_index.add_points(points_seqlock, new_ids);
+
+    CATCH_REQUIRE(seq_index.size() == initial_size + num_to_add);
+    CATCH_REQUIRE(seqlock_index.size() == initial_size + num_to_add);
 
     for (const auto& id : new_ids) {
-        CATCH_REQUIRE(index.has_id(id));
+        CATCH_REQUIRE(seq_index.has_id(id));
+        CATCH_REQUIRE(seqlock_index.has_id(id));
     }
 
-    index.search(results.view(), queries.cview(), search_params);
-    auto recall_after_add =
-        svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
-    CATCH_REQUIRE(recall_after_add > 0.0);
+    seq_index.search(seq_results.view(), queries.cview(), search_params);
+    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+    compare_results("After add");
 
     std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
-    index.delete_entries(ids_to_delete);
+    seq_index.delete_entries(ids_to_delete);
+    seqlock_index.delete_entries(ids_to_delete);
 
     for (const auto& id : ids_to_delete) {
-        CATCH_REQUIRE(index.is_deleted(id));
+        CATCH_REQUIRE(seq_index.is_deleted(id));
+        CATCH_REQUIRE(seqlock_index.is_deleted(id));
     }
 
-    index.search(results.view(), queries.cview(), search_params);
+    seq_index.search(seq_results.view(), queries.cview(), search_params);
+    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+    compare_results("After delete");
+
     for (size_t q = 0; q < queries.size(); ++q) {
         for (size_t i = 0; i < num_neighbors; ++i) {
-            const auto result_id = results.index(q, i);
+            const auto seqlock_id = seqlock_results.index(q, i);
             CATCH_REQUIRE(
-                std::find(ids_to_delete.begin(), ids_to_delete.end(), result_id) ==
+                std::find(ids_to_delete.begin(), ids_to_delete.end(), seqlock_id) ==
                 ids_to_delete.end()
             );
         }
