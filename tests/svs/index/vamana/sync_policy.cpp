@@ -19,6 +19,8 @@
 #include "svs/core/graph/graph.h"
 
 #include "svs/index/vamana/sync_policy.h"
+#include "svs/index/vamana/vamana_build.h"
+#include "svs/lib/threads/threadpool.h"
 
 // catch2
 #include "catch2/catch_test_macros.hpp"
@@ -100,6 +102,20 @@ static_assert(std::is_copy_constructible_v<vamana::AtomicCounter>);
 static_assert(std::is_move_constructible_v<vamana::AtomicCounter>);
 static_assert(std::is_copy_assignable_v<vamana::AtomicCounter>);
 static_assert(std::is_move_assignable_v<vamana::AtomicCounter>);
+
+// VamanaBuilder defaulted Sync must yield the same type as explicit SequentialSync.
+using TestData = svs::data::SimpleData<float>;
+using TestDist = svs::distance::DistanceL2;
+using TestPool = svs::threads::NativeThreadPool;
+
+static_assert(std::is_same_v<
+              vamana::VamanaBuilder<TestGraph, TestData, TestDist, TestPool>,
+              vamana::VamanaBuilder<
+                  TestGraph,
+                  TestData,
+                  TestDist,
+                  TestPool,
+                  vamana::SequentialSync>>);
 
 } // namespace
 

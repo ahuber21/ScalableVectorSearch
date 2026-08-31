@@ -26,6 +26,7 @@
 #include "svs/index/vamana/prune.h"
 #include "svs/index/vamana/search_buffer.h"
 #include "svs/index/vamana/search_tracker.h"
+#include "svs/index/vamana/sync_policy.h"
 #include "svs/lib/boundscheck.h"
 #include "svs/lib/exception.h"
 #include "svs/lib/narrow.h"
@@ -165,7 +166,8 @@ template <
     graphs::MemoryGraph Graph,
     data::ImmutableMemoryDataset Data,
     typename Dist,
-    threads::ThreadPool Pool>
+    threads::ThreadPool Pool,
+    typename Sync = SequentialSync>
 class VamanaBuilder {
   public:
     // Type Aliases
@@ -472,6 +474,7 @@ class VamanaBuilder {
         threads::parallel_for(threadpool_, [&](uint64_t tid) {
             const auto& thread_local_updates = updates.at(tid);
             for (auto [node_id, update] : thread_local_updates) {
+                auto guard = graph_.write_guard(node_id);
                 graph_.replace_node(node_id, update);
             }
         });
@@ -495,6 +498,7 @@ class VamanaBuilder {
                 for (auto node_id : is) {
                     for (auto other_id : graph_.get_node(node_id)) {
                         std::lock_guard lock{vertex_locks_[other_id]};
+                        auto guard = graph_.write_guard(other_id);
                         if (graph_.get_node_degree(other_id) < params_.graph_max_degree) {
                             graph_.add_edge(other_id, node_id);
                         } else {
@@ -571,6 +575,7 @@ class VamanaBuilder {
                             lib::as_const_span(candidates),
                             pruned_results
                         );
+                        auto guard = graph_.write_guard(src);
                         graph_.replace_node(src, pruned_results);
                     }
                 }
@@ -592,7 +597,7 @@ class VamanaBuilder {
     /// Worker threadpool.
     Pool& threadpool_;
     /// Per-vertex locks.
-    std::vector<SpinLock> vertex_locks_;
+    std::vector<typename Sync::mutex_type> vertex_locks_;
     /// Overflow backedge buffer.
     BackedgeBuffer<Idx> backedge_buffer_;
 };

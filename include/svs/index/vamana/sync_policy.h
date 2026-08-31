@@ -179,6 +179,11 @@ static_assert(SyncPolicy<SeqlockSync>);
 
 // Visitor aliases must instantiate cleanly and yield valid visitors.
 static_assert(SyncPolicyFor<SequentialSync, graphs::SimpleGraph<uint32_t>>);
-static_assert(SyncPolicyFor<SeqlockSync, graphs::SimpleGraph<uint32_t>>);
+static_assert(SyncPolicyFor<
+              SeqlockSync,
+              graphs::SimpleGraphBase<
+                  uint32_t,
+                  data::SimpleData<uint32_t>,
+                  graphs::SeqlockAccess>>);
 
 } // namespace svs::index::vamana
