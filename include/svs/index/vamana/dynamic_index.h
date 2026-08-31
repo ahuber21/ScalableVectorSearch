@@ -941,8 +941,22 @@ class MutableVamanaIndex {
         meta = SlotMetadata::Deleted;
     }
 
-    bool is_deleted(size_t i) const { return status_[i] != SlotMetadata::Valid; }
+    // Prune predicate for consolidate(). Pending must not count as deleted under the
+    // concurrent policy, or consolidation severs the in-edges of in-flight insertions.
+    bool is_deleted(size_t i) const {
+        if constexpr (Sync::reserves_pending_slots) {
+            return status_[i] == SlotMetadata::Deleted;
+        } else {
+            return status_[i] != SlotMetadata::Valid;
+        }
+    }
 
+  private:
+    // Liveness needs no policy switch: Empty and Pending are both non-live, so compact()
+    // neither relocates a slot an inserter is writing nor degenerates into an identity map.
+    bool is_live(size_t i) const { return status_[i] == SlotMetadata::Valid; }
+
+  public:
     Idx entry_point() const {
         assert(entry_point_.size() == 1);
         return entry_point_[0];
@@ -951,13 +965,13 @@ class MutableVamanaIndex {
     ///
     /// @brief Return all the non-missing internal IDs.
     ///
-    /// This includes both valid and soft-deleted entries.
+    /// This is the set of live slots: soft-deleted, empty and pending slots are excluded.
     ///
     std::vector<Idx> nonmissing_indices() const {
         auto indices = std::vector<Idx>();
         indices.reserve(size());
         for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
-            if (!is_deleted(i)) {
+            if (is_live(i)) {
                 indices.push_back(i);
             }
         }
@@ -1135,9 +1149,7 @@ class MutableVamanaIndex {
     ///// Mutation
     void consolidate() {
         auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
-        std::function<bool(size_t)> valid = [&](size_t i) {
-            return !(this->is_deleted(i));
-        };
+        std::function<bool(size_t)> valid = [&](size_t i) { return this->is_live(i); };
 
         // Determine if the entry point is deleted.
         // If so - we need to pick a new one.
@@ -1148,7 +1160,7 @@ class MutableVamanaIndex {
             auto new_entry_point =
                 extensions::compute_entry_point(data_, threadpool_, valid);
             svs::logging::debug(logger_, "New point: {}", new_entry_point);
-            assert(!is_deleted(new_entry_point));
+            assert(is_live(new_entry_point));
             entry_point_[0] = new_entry_point;
         }
 
