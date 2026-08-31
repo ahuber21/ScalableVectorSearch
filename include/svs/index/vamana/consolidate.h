@@ -31,7 +31,6 @@
 #include "tsl/robin_set.h"
 
 // stdlib
-#include <ranges>
 #include <span>
 #include <unordered_set>
 
@@ -200,7 +199,9 @@ class GraphConsolidator {
         for (auto dst : neighbors) {
             if (is_deleted(dst)) {
                 const auto& others = graph_.get_node(dst);
-                all_candidates.insert(others.begin(), others.end());
+                // AtomicSpan iterator is input_iterator_tag; copy to vector for insertion.
+                std::vector<I> neighbors_vec(others.begin(), others.end());
+                all_candidates.insert(neighbors_vec.begin(), neighbors_vec.end());
             } else {
                 all_candidates.insert(dst);
             }

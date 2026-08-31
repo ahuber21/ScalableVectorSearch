@@ -107,6 +107,16 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
         svs::distance::DistanceL2 distance{};
 
         svs::index::vamana::consolidate(
+            plain_graph,
+            data,
+            threadpool,
+            plain_graph.max_degree(),
+            750,
+            1.2,
+            distance,
+            predicate
+        );
+        svs::index::vamana::consolidate(
             seqlock_graph,
             data,
             threadpool,
@@ -117,14 +127,29 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
             predicate
         );
 
+        check_post_conditions(plain_graph, predicate);
         check_post_conditions(seqlock_graph, predicate);
 
-        size_t total_edges = 0;
-        for (size_t i = 0; i < seqlock_graph.n_nodes(); ++i) {
-            const auto& neighbors = seqlock_graph.get_node(i);
-            total_edges += neighbors.size();
-            CATCH_REQUIRE(neighbors.size() <= seqlock_graph.max_degree());
+        size_t plain_total_edges = 0;
+        size_t seqlock_total_edges = 0;
+
+        for (size_t i = 0; i < plain_graph.n_nodes(); ++i) {
+            const auto& plain_neighbors = plain_graph.get_node(i);
+            const auto& seqlock_neighbors = seqlock_graph.get_node(i);
+
+            plain_total_edges += plain_neighbors.size();
+            seqlock_total_edges += seqlock_neighbors.size();
+
+            std::unordered_set<uint32_t> plain_set(
+                plain_neighbors.begin(), plain_neighbors.end()
+            );
+            std::unordered_set<uint32_t> seqlock_set(
+                seqlock_neighbors.begin(), seqlock_neighbors.end()
+            );
+
+            CATCH_REQUIRE(plain_set == seqlock_set);
         }
-        CATCH_REQUIRE(total_edges > 0);
+
+        CATCH_REQUIRE(plain_total_edges == seqlock_total_edges);
     }
 }
