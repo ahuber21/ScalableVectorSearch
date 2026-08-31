@@ -101,6 +101,36 @@ struct WithNullMutex {
 };
 static_assert(sizeof(WithNullMutex) == sizeof(size_t));
 
+// Slot layout shared by the predicate state table below: one slot per SlotMetadata state.
+constexpr size_t empty_slot = 0;
+constexpr size_t valid_slot = 1;
+constexpr size_t deleted_slot = 2;
+constexpr size_t pending_slot = 3;
+
+template <typename Sync> auto make_status_table() {
+    using Container = typename Sync::template container_type<vamana::SlotMetadata>;
+    auto status = Container(4, vamana::SlotMetadata::Empty);
+    status[valid_slot] = vamana::SlotMetadata::Valid;
+    status[deleted_slot] = vamana::SlotMetadata::Deleted;
+    status[pending_slot] = vamana::SlotMetadata::Pending;
+    return status;
+}
+
+// The predicate bodies are duplicated from MutableVamanaIndex in dynamic_index.h, which
+// cannot be instantiated with SeqlockSync yet; the trait and container are the real ones.
+template <typename Sync, typename Container>
+bool prune_predicate(const Container& status, size_t i) {
+    if constexpr (Sync::reserves_pending_slots) {
+        return status[i] == vamana::SlotMetadata::Deleted;
+    } else {
+        return status[i] != vamana::SlotMetadata::Valid;
+    }
+}
+
+template <typename Container> bool live_predicate(const Container& status, size_t i) {
+    return status[i] == vamana::SlotMetadata::Valid;
+}
+
 static_assert(std::is_copy_constructible_v<vamana::AtomicCounter>);
 static_assert(std::is_move_constructible_v<vamana::AtomicCounter>);
 static_assert(std::is_copy_assignable_v<vamana::AtomicCounter>);
@@ -366,5 +396,51 @@ CATCH_TEST_CASE("Slot Metadata State Transitions", "[index][vamana][sync_policy]
         CATCH_REQUIRE(!is_valid(SlotMetadata::Empty, true));
         CATCH_REQUIRE(!is_valid(SlotMetadata::Pending, false));
         CATCH_REQUIRE(!is_valid(SlotMetadata::Pending, true));
+    }
+}
+
+CATCH_TEST_CASE("Slot Metadata Predicates", "[index][vamana][sync_policy]") {
+    auto sequential = make_status_table<vamana::SequentialSync>();
+    auto seqlock = make_status_table<vamana::SeqlockSync>();
+
+    CATCH_SECTION("Liveness admits only Valid, under both policies") {
+        for (size_t i = 0; i < 4; ++i) {
+            bool expected = (i == valid_slot);
+            CATCH_REQUIRE(live_predicate(sequential, i) == expected);
+            CATCH_REQUIRE(live_predicate(seqlock, i) == expected);
+        }
+    }
+
+    CATCH_SECTION("The prune predicate is policy dependent") {
+        // Sequential prunes everything that is not Valid; concurrent prunes only Deleted.
+        CATCH_REQUIRE(prune_predicate<vamana::SequentialSync>(sequential, empty_slot));
+        CATCH_REQUIRE(!prune_predicate<vamana::SequentialSync>(sequential, valid_slot));
+        CATCH_REQUIRE(prune_predicate<vamana::SequentialSync>(sequential, deleted_slot));
+        CATCH_REQUIRE(prune_predicate<vamana::SequentialSync>(sequential, pending_slot));
+
+        CATCH_REQUIRE(!prune_predicate<vamana::SeqlockSync>(seqlock, empty_slot));
+        CATCH_REQUIRE(!prune_predicate<vamana::SeqlockSync>(seqlock, valid_slot));
+        CATCH_REQUIRE(prune_predicate<vamana::SeqlockSync>(seqlock, deleted_slot));
+        CATCH_REQUIRE(!prune_predicate<vamana::SeqlockSync>(seqlock, pending_slot));
+    }
+
+    CATCH_SECTION("Pending is live under neither policy but pruned only by sequential") {
+        // Pruning a Pending slot severs the in-edges of an in-flight insertion, leaving the
+        // new point unreachable by search.
+        CATCH_REQUIRE(!live_predicate(sequential, pending_slot));
+        CATCH_REQUIRE(!live_predicate(seqlock, pending_slot));
+        CATCH_REQUIRE(prune_predicate<vamana::SequentialSync>(sequential, pending_slot));
+        CATCH_REQUIRE(!prune_predicate<vamana::SeqlockSync>(seqlock, pending_slot));
+    }
+
+    CATCH_SECTION("Sequential liveness is the exact complement of pruning") {
+        // This equality is what makes replacing `!is_deleted(i)` with `is_live(i)` a rename
+        // rather than a behaviour change on the sequential path.
+        for (size_t i = 0; i < 4; ++i) {
+            CATCH_REQUIRE(
+                live_predicate(sequential, i) !=
+                prune_predicate<vamana::SequentialSync>(sequential, i)
+            );
+        }
     }
 }
