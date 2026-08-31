@@ -258,31 +258,28 @@ option(SVS_BUILD_TSAN_TESTS
 )
 
 if (SVS_BUILD_TSAN_TESTS)
-    # Positive control: concurrent index with SeqlockSync should be race-free.
-    add_executable(concurrent_tsan
-        ${TEST_DIR}/svs/concurrent/concurrency.cpp
-    )
-    target_compile_options(concurrent_tsan PRIVATE -fsanitize=thread -g -O1)
-    target_link_options(concurrent_tsan PRIVATE -fsanitize=thread)
-    target_compile_definitions(concurrent_tsan PRIVATE SVS_THREAD_SANITIZER)
-    target_compile_definitions(concurrent_tsan PRIVATE SVS_TEST_DATA_DIR="${DATA_DIRECTORY}")
-    target_link_libraries(concurrent_tsan PRIVATE svs::svs Catch2::Catch2WithMain)
-    target_link_libraries(concurrent_tsan PRIVATE svs_compile_options svs_x86_options_base)
-    target_include_directories(concurrent_tsan PRIVATE ${PROJECT_SOURCE_DIR})
-    add_test(NAME concurrent_tsan COMMAND concurrent_tsan)
-    set_tests_properties(concurrent_tsan PROPERTIES LABELS "tsan")
+    # ThreadSanitizer aborts with "unexpected memory mapping" unless ASLR is disabled,
+    # so every target here is launched through setarch rather than directly.
+    function(svs_add_tsan_test name source)
+        add_executable(${name} ${source})
+        target_compile_options(${name} PRIVATE -fsanitize=thread -g -O1)
+        target_link_options(${name} PRIVATE -fsanitize=thread)
+        target_compile_definitions(${name} PRIVATE SVS_THREAD_SANITIZER)
+        target_compile_definitions(${name} PRIVATE SVS_TEST_DATA_DIR="${DATA_DIRECTORY}")
+        target_link_libraries(${name} PRIVATE svs::svs Catch2::Catch2WithMain)
+        target_link_libraries(${name} PRIVATE svs_compile_options svs_x86_options_base)
+        target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR})
+        add_test(NAME ${name} COMMAND setarch x86_64 -R $<TARGET_FILE:${name}>)
+        set_tests_properties(${name} PROPERTIES LABELS "tsan")
+    endfunction()
 
-    # Negative control: unsafe SequentialSync policy must exhibit data races.
-    add_executable(concurrent_tsan_negative
-        ${TEST_DIR}/svs/concurrent/concurrency_unsafe.cpp
+    # Positive control: concurrent index with SeqlockSync should be race-free.
+    svs_add_tsan_test(concurrent_tsan ${TEST_DIR}/svs/concurrent/concurrency.cpp)
+
+    # Negative control: the unsafe policy combination must make TSan report a race.
+    # A clean positive run means nothing unless this one fails, hence WILL_FAIL.
+    svs_add_tsan_test(
+        concurrent_tsan_negative ${TEST_DIR}/svs/concurrent/concurrency_unsafe.cpp
     )
-    target_compile_options(concurrent_tsan_negative PRIVATE -fsanitize=thread -g -O1)
-    target_link_options(concurrent_tsan_negative PRIVATE -fsanitize=thread)
-    target_compile_definitions(concurrent_tsan_negative PRIVATE SVS_THREAD_SANITIZER)
-    target_compile_definitions(concurrent_tsan_negative PRIVATE SVS_TEST_DATA_DIR="${DATA_DIRECTORY}")
-    target_link_libraries(concurrent_tsan_negative PRIVATE svs::svs Catch2::Catch2WithMain)
-    target_link_libraries(concurrent_tsan_negative PRIVATE svs_compile_options svs_x86_options_base)
-    target_include_directories(concurrent_tsan_negative PRIVATE ${PROJECT_SOURCE_DIR})
-    add_test(NAME concurrent_tsan_negative COMMAND concurrent_tsan_negative)
-    set_tests_properties(concurrent_tsan_negative PROPERTIES WILL_FAIL TRUE LABELS "tsan")
+    set_tests_properties(concurrent_tsan_negative PROPERTIES WILL_FAIL TRUE)
 endif()
