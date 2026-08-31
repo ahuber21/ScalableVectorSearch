@@ -29,6 +29,7 @@
 #include <atomic>
 #include <concepts>
 #include <cstddef>
+#include <shared_mutex>
 #include <vector>
 
 namespace svs::index::vamana {
@@ -111,22 +112,26 @@ concept SyncCounter =
 
 /// @brief Bundle of the synchronization seams used by the mutable Vamana index.
 ///
-/// A policy supplies the mutex, counter, graph access, node visitor and growth types the
-/// index composes, plus flags selecting the slot-lifetime and translator protocols.
+/// A policy supplies the mutex, counter, graph access and growth types the index composes,
+/// a graph-parameterized visitor alias, and flags selecting the slot-lifetime and
+/// translator protocols.
 template <typename P>
 concept SyncPolicy = requires {
                          typename P::mutex_type;
                          typename P::counter_type;
                          typename P::graph_access_type;
-                         typename P::node_visitor_type;
                          typename P::growth_type;
                          typename P::template container_type<int>;
                          requires SyncCounter<typename P::counter_type>;
-                         requires NodeVisitor<typename P::node_visitor_type>;
                          { P::reserves_pending_slots } -> std::convertible_to<bool>;
                          { P::defers_translator_cleanup } -> std::convertible_to<bool>;
                          { P::supplements_search_buffer } -> std::convertible_to<bool>;
                      };
+
+/// @brief A synchronization policy together with the graph type it will be used with.
+template <typename P, typename Graph>
+concept SyncPolicyFor =
+    SyncPolicy<P> && NodeVisitor<typename P::template node_visitor_type<Graph>>;
 
 /// @brief Synchronization policy for single-threaded use.
 ///
@@ -136,9 +141,9 @@ struct SequentialSync {
     using mutex_type = lib::NullMutex;
     using counter_type = PlainCounter;
     using graph_access_type = graphs::PlainAccess;
-    using node_visitor_type = VisitOnce;
     using growth_type = data::Reallocating;
 
+    template <typename Graph> using node_visitor_type = VisitOnce;
     template <typename T> using container_type = std::vector<T>;
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
@@ -149,8 +154,31 @@ struct SequentialSync {
     static constexpr bool supplements_search_buffer = false;
 };
 
+/// @brief Synchronization policy for concurrent readers with seqlock-protected adjacency.
+///
+/// Uses atomic counters, seqlock-protected graph access, segment-stable containers, and
+/// a node visitor that retries on seqlock validation failure.
+struct SeqlockSync {
+    using mutex_type = std::shared_mutex;
+    using counter_type = AtomicCounter;
+    using graph_access_type = graphs::SeqlockAccess;
+    using growth_type = data::SegmentStable;
+
+    template <typename Graph> using node_visitor_type = SeqlockVisitor<Graph>;
+    template <typename T> using container_type = lib::SegmentedVector<T>;
+
+    static constexpr bool reserves_pending_slots = true;
+    static constexpr bool defers_translator_cleanup = true;
+    static constexpr bool supplements_search_buffer = true;
+};
+
 static_assert(SyncCounter<PlainCounter>);
 static_assert(SyncCounter<AtomicCounter>);
 static_assert(SyncPolicy<SequentialSync>);
+static_assert(SyncPolicy<SeqlockSync>);
+
+// Visitor aliases must instantiate cleanly and yield valid visitors.
+static_assert(SyncPolicyFor<SequentialSync, graphs::SimpleGraph<uint32_t>>);
+static_assert(SyncPolicyFor<SeqlockSync, graphs::SimpleGraph<uint32_t>>);
 
 } // namespace svs::index::vamana

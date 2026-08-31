@@ -116,6 +116,33 @@ struct VisitOnce {
     template <typename F> void operator()(size_t /*node_id*/, F&& body) const { body(); }
 };
 
+/// Visitor that wraps node expansion in a seqlock retry loop.
+/// Reads the node's seqlock counter before invoking the body, then validates afterward.
+/// On validation failure, retries the body. Stale entries already pushed into the search
+/// buffer are tolerated because the buffer deduplicates by ID.
+template <graphs::ImmutableMemoryGraph Graph> class SeqlockVisitor {
+  public:
+    explicit SeqlockVisitor(const Graph& graph)
+        : graph_{graph} {}
+
+    template <typename F> void operator()(size_t node_id, F&& body) const {
+        using Idx = typename Graph::index_type;
+        while (true) {
+            auto seq_opt = graph_.read_begin(static_cast<Idx>(node_id));
+            if (!seq_opt.has_value()) {
+                continue;
+            }
+            body();
+            if (graph_.read_validate(static_cast<Idx>(node_id), seq_opt.value())) {
+                break;
+            }
+        }
+    }
+
+  private:
+    const Graph& graph_;
+};
+
 /// Concept for per-node visitors.
 /// A visitor receives the node ID and a nullary callable body containing the expansion
 /// logic, and may invoke that body one or more times.

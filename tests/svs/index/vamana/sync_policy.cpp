@@ -34,20 +34,32 @@ namespace vamana = svs::index::vamana;
 
 // The sequential policy must select exactly the types the index used before it was
 // parameterized; a change here silently alters the single-threaded index.
+using TestGraph = svs::graphs::SimpleGraph<uint32_t>;
+
 static_assert(std::is_same_v<vamana::SequentialSync::mutex_type, svs::lib::NullMutex>);
 static_assert(std::is_same_v<
               vamana::SequentialSync::graph_access_type,
               svs::graphs::PlainAccess>);
-static_assert(std::is_same_v<vamana::SequentialSync::node_visitor_type, vamana::VisitOnce>);
+static_assert(std::is_same_v<
+              vamana::SequentialSync::node_visitor_type<TestGraph>,
+              vamana::VisitOnce>);
 static_assert(std::is_same_v<vamana::SequentialSync::growth_type, svs::data::Reallocating>);
 static_assert(std::is_same_v<
               vamana::SequentialSync::template container_type<int>,
               std::vector<int>>);
 
 static_assert(vamana::SyncPolicy<vamana::SequentialSync>);
+static_assert(vamana::SyncPolicyFor<vamana::SequentialSync, TestGraph>);
 static_assert(!vamana::SequentialSync::reserves_pending_slots);
 static_assert(!vamana::SequentialSync::defers_translator_cleanup);
 static_assert(!vamana::SequentialSync::supplements_search_buffer);
+
+// The seqlock policy must yield SeqlockVisitor for its graph type.
+static_assert(std::is_same_v<
+              vamana::SeqlockSync::node_visitor_type<TestGraph>,
+              vamana::SeqlockVisitor<TestGraph>>);
+static_assert(vamana::SyncPolicy<vamana::SeqlockSync>);
+static_assert(vamana::SyncPolicyFor<vamana::SeqlockSync, TestGraph>);
 
 // A policy missing any one member must not satisfy the concept, otherwise the concept is
 // decorative and a malformed policy fails deep inside the index instead.
@@ -67,14 +79,15 @@ struct BadVisitor {
     using mutex_type = svs::lib::NullMutex;
     using counter_type = vamana::PlainCounter;
     using graph_access_type = svs::graphs::PlainAccess;
-    using node_visitor_type = int;
     using growth_type = svs::data::Reallocating;
+    template <typename Graph> using node_visitor_type = int;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
     static constexpr bool defers_translator_cleanup = false;
     static constexpr bool supplements_search_buffer = false;
 };
-static_assert(!vamana::SyncPolicy<BadVisitor>);
+static_assert(vamana::SyncPolicy<BadVisitor>);
+static_assert(!vamana::SyncPolicyFor<BadVisitor, TestGraph>);
 
 // The whole point of NullMutex is that a member costs nothing.
 struct WithNullMutex {
