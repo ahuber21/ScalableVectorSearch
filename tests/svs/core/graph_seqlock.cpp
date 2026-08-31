@@ -117,9 +117,8 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock]") {
 
     SeqlockGraph graph(n_nodes, max_degree);
 
-    // This test exercises the seqlock read/validate protocol.
-    // Reverse-edge maintenance inside write guards would starve readers and obscure the
-    // actual test.
+    // Reader starvation from reverse-edge maintenance inside write guards obscures the
+    // actual seqlock read/validate protocol test.
     graph.reverse_edges()->set_recording(false);
 
     // Two distinct valid states for the test node
