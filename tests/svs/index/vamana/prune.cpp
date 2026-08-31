@@ -144,24 +144,27 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
             // produce valid results, then confirm they sometimes diverge.
             constexpr size_t num_points = 20;
             constexpr size_t dims = 4;
-            auto dataset = svs::data::SimpleData<float>(num_points, dims);
-
-            std::mt19937 rng(42);
-            std::uniform_real_distribution<float> dist(0.0f, 10.0f);
-            for (size_t i = 0; i < num_points; ++i) {
-                for (size_t j = 0; j < dims; ++j) {
-                    dataset.get_datum(i)[j] = dist(rng);
-                }
-            }
-
             auto accessor = SimpleAccessor();
             auto distance = svs::distance::DistanceL2();
             constexpr size_t max_result_size = 5;
             constexpr float alpha = 1.3f;
             constexpr size_t num_trials = 50;
 
+            // RNG and distribution live outside the loop so the sequence advances
+            // across trials while the test remains deterministic.
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist(0.0f, 10.0f);
+
             size_t divergence_count = 0;
             for (size_t trial = 0; trial < num_trials; ++trial) {
+                // Generate a fresh random dataset for each trial.
+                auto dataset = svs::data::SimpleData<float>(num_points, dims);
+                for (size_t i = 0; i < num_points; ++i) {
+                    for (size_t j = 0; j < dims; ++j) {
+                        dataset.get_datum(i)[j] = dist(rng);
+                    }
+                }
+
                 // Build a random pool of 10 neighbors for node 0.
                 std::vector<svs::Neighbor<size_t>> pool;
                 for (size_t i = 1; i < std::min(num_points, size_t(11)); ++i) {
@@ -198,8 +201,12 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
                     result_iterative
                 );
 
-                // Validity checks for both strategies.
-                for (const auto& result : {result_two_phase, result_iterative}) {
+                // Validity checks for both strategies, avoiding copies from
+                // initializer_list.
+                std::vector<const std::vector<size_t>*> results = {
+                    &result_two_phase, &result_iterative};
+                for (const auto result_ptr : results) {
+                    const auto& result = *result_ptr;
                     CATCH_REQUIRE(result.size() <= max_result_size);
                     for (size_t i = 0; i < result.size(); ++i) {
                         CATCH_REQUIRE(result[i] != 0);
@@ -222,6 +229,7 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
                 }
             }
 
+            CATCH_INFO("divergence_count: " << divergence_count << " / " << num_trials);
             // If the strategies diverged at least once, the tag is meaningful.
             CATCH_REQUIRE(divergence_count > 0);
         }
