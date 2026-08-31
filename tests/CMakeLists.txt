@@ -151,7 +151,7 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/index/vamana/multi.cpp
     # Concurrent (SeqlockSync policy) Vamana index.
     ${TEST_DIR}/svs/concurrent/concurrency.cpp
-    # ${TEST_DIR}/svs/concurrent/downstream.cpp -- blocked on scalar quantization allocator
+    ${TEST_DIR}/svs/concurrent/downstream.cpp
     # Inverted
     ${TEST_DIR}/svs/index/inverted/clustering.cpp
     ${TEST_DIR}/svs/index/inverted/memory_based.cpp
