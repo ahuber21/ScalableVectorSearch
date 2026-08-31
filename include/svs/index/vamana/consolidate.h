@@ -199,6 +199,9 @@ class GraphConsolidator {
         for (auto dst : neighbors) {
             if (is_deleted(dst)) {
                 const auto& others = graph_.get_node(dst);
+                // Reserve capacity to match range-insert behavior and preserve iteration
+                // order.
+                all_candidates.reserve(all_candidates.size() + others.size());
                 for (auto n : others) {
                     all_candidates.insert(n);
                 }
