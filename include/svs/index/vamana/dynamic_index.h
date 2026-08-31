@@ -875,10 +875,16 @@ class MutableVamanaIndex {
         builder.construct(alpha_, entry_point(), slots, logging::Level::Trace, logger_);
 
         // Mark all added entries as valid.
-        // When reserves_pending_slots=true this promotes from Pending; otherwise from
-        // Empty.
+        // When reserves_pending_slots=true, only promote slots still Pending; a slot
+        // deleted mid-populate stays Deleted so the delete wins.
         for (const auto& i : slots) {
-            status_[i] = SlotMetadata::Valid;
+            if constexpr (Sync::reserves_pending_slots) {
+                if (status_[i] == SlotMetadata::Pending) {
+                    status_[i] = SlotMetadata::Valid;
+                }
+            } else {
+                status_[i] = SlotMetadata::Valid;
+            }
         }
         guard.commit();
 
