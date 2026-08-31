@@ -134,6 +134,8 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
 
         size_t plain_total_edges = 0;
         size_t seqlock_total_edges = 0;
+        size_t nodes_with_differing_sets = 0;
+        size_t first_mismatch = SIZE_MAX;
 
         for (size_t i = 0; i < plain_graph.n_nodes(); ++i) {
             const auto& plain_neighbors = plain_graph.get_node(i);
@@ -149,9 +151,16 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
                 seqlock_neighbors.begin(), seqlock_neighbors.end()
             );
 
-            CATCH_REQUIRE(plain_set == seqlock_set);
+            if (plain_set != seqlock_set) {
+                ++nodes_with_differing_sets;
+                if (first_mismatch == SIZE_MAX) {
+                    first_mismatch = i;
+                }
+            }
         }
 
+        CATCH_INFO("First mismatch at node " << first_mismatch);
+        CATCH_REQUIRE(nodes_with_differing_sets == 0);
         CATCH_REQUIRE(plain_total_edges == seqlock_total_edges);
     }
 }
