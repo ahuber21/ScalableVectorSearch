@@ -30,6 +30,7 @@
 // stdlib
 #include <concepts>
 #include <functional>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -50,10 +51,14 @@ void check_post_conditions(const Graph& graph, Predicate&& predicate) {
         const auto& neighbors = graph.get_node(i);
         CATCH_REQUIRE(std::none_of(neighbors.begin(), neighbors.end(), predicate));
 
-        // Don't invent nodes out of thin air.
         CATCH_REQUIRE(std::all_of(neighbors.begin(), neighbors.end(), [&](const auto& i) {
             return node_range.contains(i);
         }));
+
+        CATCH_REQUIRE(neighbors.size() <= graph.max_degree());
+
+        std::unordered_set<uint32_t> unique_neighbors(neighbors.begin(), neighbors.end());
+        CATCH_REQUIRE(unique_neighbors.size() == neighbors.size());
     }
     CATCH_REQUIRE(contains_deleted);
 }
@@ -94,6 +99,15 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
             svs::data::SimpleData<uint32_t, svs::Dynamic>,
             svs::graphs::SeqlockAccess>;
 
+        static_assert(
+            std::ranges::random_access_range<std::span<const uint32_t>>,
+            "std::span routes through random-access branch"
+        );
+        static_assert(
+            !std::ranges::random_access_range<svs::AtomicSpan<const uint32_t>>,
+            "AtomicSpan routes through weak-iterator branch"
+        );
+
         auto plain_graph = test_dataset::graph();
         SeqlockGraph seqlock_graph(plain_graph.n_nodes(), plain_graph.max_degree());
 
@@ -129,38 +143,8 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
             predicate
         );
 
+        // Structural invariants hold for both sync policies.
         check_post_conditions(plain_graph, predicate);
         check_post_conditions(seqlock_graph, predicate);
-
-        size_t plain_total_edges = 0;
-        size_t seqlock_total_edges = 0;
-        size_t nodes_with_differing_sets = 0;
-        size_t first_mismatch = SIZE_MAX;
-
-        for (size_t i = 0; i < plain_graph.n_nodes(); ++i) {
-            const auto& plain_neighbors = plain_graph.get_node(i);
-            const auto& seqlock_neighbors = seqlock_graph.get_node(i);
-
-            plain_total_edges += plain_neighbors.size();
-            seqlock_total_edges += seqlock_neighbors.size();
-
-            std::unordered_set<uint32_t> plain_set(
-                plain_neighbors.begin(), plain_neighbors.end()
-            );
-            std::unordered_set<uint32_t> seqlock_set(
-                seqlock_neighbors.begin(), seqlock_neighbors.end()
-            );
-
-            if (plain_set != seqlock_set) {
-                ++nodes_with_differing_sets;
-                if (first_mismatch == SIZE_MAX) {
-                    first_mismatch = i;
-                }
-            }
-        }
-
-        CATCH_INFO("First mismatch at node " << first_mismatch);
-        CATCH_REQUIRE(nodes_with_differing_sets == 0);
-        CATCH_REQUIRE(plain_total_edges == seqlock_total_edges);
     }
 }

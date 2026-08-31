@@ -31,6 +31,7 @@
 #include "tsl/robin_set.h"
 
 // stdlib
+#include <ranges>
 #include <span>
 #include <unordered_set>
 
@@ -199,11 +200,16 @@ class GraphConsolidator {
         for (auto dst : neighbors) {
             if (is_deleted(dst)) {
                 const auto& others = graph_.get_node(dst);
-                // Reserve capacity to match range-insert behavior and preserve iteration
-                // order.
-                all_candidates.reserve(all_candidates.size() + others.size());
-                for (auto n : others) {
-                    all_candidates.insert(n);
+                if constexpr (std::ranges::random_access_range<
+                                  std::remove_cvref_t<decltype(others)>>) {
+                    all_candidates.insert(others.begin(), others.end());
+                } else {
+                    // Reserve then insert element-wise. The reserve stabilizes iteration
+                    // order which determines which edge consolidation prunes.
+                    all_candidates.reserve(all_candidates.size() + others.size());
+                    for (auto n : others) {
+                        all_candidates.insert(n);
+                    }
                 }
             } else {
                 all_candidates.insert(dst);
