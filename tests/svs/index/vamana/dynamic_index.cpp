@@ -553,7 +553,7 @@ CATCH_TEST_CASE(
     auto compare_results = [&](const char* description,
                                svs::QueryResult<size_t>& r1,
                                svs::QueryResult<size_t>& r2,
-                               size_t max_differing_queries) {
+                               bool assert_deterministic) {
         auto recall1 = svs::k_recall_at_n(groundtruth, r1, num_neighbors, num_neighbors);
         auto recall2 = svs::k_recall_at_n(groundtruth, r2, num_neighbors, num_neighbors);
 
@@ -572,19 +572,42 @@ CATCH_TEST_CASE(
             }
         }
 
-        if (total_mismatches > 0) {
-            CATCH_WARN(
-                description << ": " << differing_queries << "/" << queries.size()
-                            << " queries differ, " << total_mismatches
-                            << " total mismatches. "
-                            << "Recall1: " << recall1 << ", Recall2: " << recall2
-            );
+        CATCH_INFO(
+            description << ": " << differing_queries << "/" << queries.size()
+                        << " queries differ, " << total_mismatches << " total mismatches. "
+                        << "Recall1: " << recall1 << ", Recall2: " << recall2
+        );
+
+        if (assert_deterministic) {
+            CATCH_REQUIRE(differing_queries == 0);
         }
-        CATCH_REQUIRE(differing_queries <= max_differing_queries);
         CATCH_REQUIRE(std::abs(recall1 - recall2) <= 0.01);
     };
 
-    CATCH_SECTION("Same-policy control: two SequentialSync builds") {
+    CATCH_SECTION("Same-policy control: single-threaded") {
+        auto data1 = test_dataset::data_f32();
+        auto data2 = test_dataset::data_f32();
+        const size_t initial_size = data1.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto index1 =
+            SeqIndex(parameters, std::move(data1), indices, Distance(), size_t{1});
+        auto index2 =
+            SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{1});
+
+        auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        index1.search(results1.view(), queries.cview(), search_params);
+        index2.search(results2.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Same-policy control (SequentialSync, num_threads=1)", results1, results2, true
+        );
+    }
+
+    CATCH_SECTION("Same-policy control: multi-threaded") {
         auto data1 = test_dataset::data_f32();
         auto data2 = test_dataset::data_f32();
         const size_t initial_size = data1.size();
@@ -603,7 +626,7 @@ CATCH_TEST_CASE(
         index2.search(results2.view(), queries.cview(), search_params);
 
         compare_results(
-            "Same-policy control (SequentialSync, num_threads=2)", results1, results2, 700
+            "Same-policy control (SequentialSync, num_threads=2)", results1, results2, false
         );
     }
 
@@ -630,11 +653,13 @@ CATCH_TEST_CASE(
             "Cross-policy (SequentialSync vs SeqlockSync, num_threads=1)",
             seq_results,
             seqlock_results,
-            0
+            true
         );
     }
 
     CATCH_SECTION("Cross-policy multi-threaded") {
+        // Multi-threaded builds are nondeterministic; only single-threaded arms
+        // establish policy equivalence.
         auto data_seq = test_dataset::data_f32();
         auto data_seqlock = test_dataset::data_f32();
         const size_t initial_size = data_seq.size();
@@ -656,7 +681,10 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: Initial build", seq_results, seqlock_results, 700
+            "Cross-policy multi-threaded: Initial build",
+            seq_results,
+            seqlock_results,
+            false
         );
 
         const size_t num_to_add = 5;
@@ -690,7 +718,7 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: After add", seq_results, seqlock_results, 700
+            "Cross-policy multi-threaded: After add", seq_results, seqlock_results, false
         );
 
         std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
@@ -705,7 +733,7 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results, 700
+            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results, false
         );
 
         for (size_t q = 0; q < queries.size(); ++q) {
