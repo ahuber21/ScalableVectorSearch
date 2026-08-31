@@ -940,7 +940,7 @@ class MutableVamanaIndex {
     }
 
     void delete_entry(size_t i) {
-        SlotMetadata& meta = getindex(status_, i);
+        auto& meta = getindex(status_, i);
         if constexpr (Sync::reserves_pending_slots) {
             // Pending slots can be deleted (races with concurrent add_points).
             assert(meta == SlotMetadata::Valid || meta == SlotMetadata::Pending);
@@ -1083,7 +1083,7 @@ class MutableVamanaIndex {
                     continue;
                 }
 
-                auto status = getindex(status_, old_id);
+                SlotMetadata status = getindex(status_, old_id);
                 status_[new_id] = status;
                 if (status == SlotMetadata::Valid) {
                     translator_.remap_internal_id(old_id, new_id);

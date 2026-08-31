@@ -20,6 +20,7 @@
 // calls into `distance` that bind their candidate set at definition context.
 #include "svs/core/data/simple.h"
 #include "svs/core/graph/graph.h"
+#include "svs/lib/concurrency/atomic_value.h"
 #include "svs/lib/movable_mutex.h"
 #include "svs/lib/null_mutex.h"
 #include "svs/lib/segmented_vector.h"
@@ -166,7 +167,9 @@ struct SeqlockSync {
     using growth_type = data::SegmentStable;
 
     template <typename Graph> using node_visitor_type = SeqlockVisitor<Graph>;
-    template <typename T> using container_type = lib::SegmentedVector<T>;
+    // Lock-free readers (greedy_search inside ValidBuilder) access this container while
+    // writers (add_points) mutate it. Wrapping the element type makes every access atomic.
+    template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
     static constexpr bool defers_translator_cleanup = true;

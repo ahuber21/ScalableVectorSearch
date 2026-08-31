@@ -165,6 +165,31 @@ static_assert(std::is_move_constructible_v<vamana::AtomicCounter>);
 static_assert(std::is_copy_assignable_v<vamana::AtomicCounter>);
 static_assert(std::is_move_assignable_v<vamana::AtomicCounter>);
 
+// The sequential policy's container must be exactly the unwrapped type the index used
+// before it was parameterized.
+static_assert(std::is_same_v<
+              vamana::SequentialSync::template container_type<vamana::SlotMetadata>,
+              std::vector<vamana::SlotMetadata>>);
+
+// The seqlock policy's container wraps the element type to make every access atomic.
+static_assert(std::is_same_v<
+              vamana::SeqlockSync::template container_type<
+                  vamana::SlotMetadata>::value_type,
+              svs::lib::AtomicValue<vamana::SlotMetadata>>);
+
+// The wrapper must be the same size and alignment as the underlying type, since the
+// index's memory accounting assumes one byte per SlotMetadata.
+static_assert(
+    sizeof(svs::lib::AtomicValue<vamana::SlotMetadata>) == sizeof(vamana::SlotMetadata)
+);
+static_assert(
+    alignof(svs::lib::AtomicValue<vamana::SlotMetadata>) == alignof(vamana::SlotMetadata)
+);
+
+// The wrapper must be copyable because SegmentedVector::resize with a fill value calls
+// `new (p) T(*fill)`, which requires a copy constructor.
+static_assert(std::is_copy_constructible_v<svs::lib::AtomicValue<vamana::SlotMetadata>>);
+
 } // namespace
 
 CATCH_TEST_CASE("Sync Policy Counters", "[index][vamana][sync_policy]") {

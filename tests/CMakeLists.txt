@@ -95,6 +95,7 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/lib/version.cpp
     ${TEST_DIR}/svs/lib/uuid.cpp
     ${TEST_DIR}/svs/lib/concurrency/atomic_span.cpp
+    ${TEST_DIR}/svs/lib/concurrency/atomic_value.cpp
     ${TEST_DIR}/svs/lib/concurrency/readwrite_protected.cpp
     ${TEST_DIR}/svs/lib/concurrency/seqlock.cpp
     ${TEST_DIR}/svs/lib/avx_detection.cpp
