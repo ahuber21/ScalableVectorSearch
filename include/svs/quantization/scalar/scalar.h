@@ -529,6 +529,21 @@ class SQDataset {
     void prefetch(size_t i) const { data_.prefetch(i); }
 };
 
+} // namespace scalar
+} // namespace quantization
+
+namespace data {
+// Address-stable SQDataset: lock-free searchers dereference the dataset without a lock,
+// so a relocating grow would free memory under them.
+template <typename T, size_t Extent, typename Alloc>
+inline constexpr bool
+    is_dataset_grow_stable_v<quantization::scalar::SQDataset<T, Extent, Alloc>> =
+        is_grow_stable_v<Alloc>;
+} // namespace data
+
+namespace quantization {
+namespace scalar {
+
 /////
 ///// Support for index building.
 /////
