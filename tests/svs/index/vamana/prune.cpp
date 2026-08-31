@@ -230,8 +230,8 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
             }
 
             CATCH_INFO("divergence_count: " << divergence_count << " / " << num_trials);
-            // If the strategies diverged at least once, the tag is meaningful.
-            CATCH_REQUIRE(divergence_count > 0);
+            // The two strategies disagree on most inputs, validating the distinct tag.
+            CATCH_REQUIRE(divergence_count > num_trials / 2);
         }
     }
 }
