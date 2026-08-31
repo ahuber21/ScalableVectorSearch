@@ -131,6 +131,11 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock][!mayfail]") {
     std::atomic<bool> stop_flag{false};
     std::array<std::atomic<size_t>, num_readers> validated_reads{};
 
+    // Catch2 assertions are not thread-safe; accumulate failures here for main-thread
+    // check.
+    std::atomic<size_t> bad_size{0};
+    std::atomic<size_t> torn_reads{0};
+
     // Writer thread: alternate between state_a and state_b
     auto writer = std::thread([&]() {
         while (!start_flag.load(std::memory_order_acquire)) {
@@ -169,12 +174,16 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock][!mayfail]") {
                     }
 
                     // Validated read must be exactly state_a or state_b
-                    CATCH_REQUIRE(snapshot.size() == max_degree);
+                    if (snapshot.size() != max_degree) {
+                        bad_size.fetch_add(1, std::memory_order_relaxed);
+                    }
                     bool is_a =
                         std::equal(snapshot.begin(), snapshot.end(), state_a.begin());
                     bool is_b =
                         std::equal(snapshot.begin(), snapshot.end(), state_b.begin());
-                    CATCH_REQUIRE((is_a || is_b));
+                    if (!(is_a || is_b)) {
+                        torn_reads.fetch_add(1, std::memory_order_relaxed);
+                    }
                     ++validated;
                     break;
                 }
@@ -200,6 +209,13 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock][!mayfail]") {
         size_t count = validated_reads[tid].load(std::memory_order_acquire);
         CATCH_REQUIRE(count == iterations);
     }
+
+    // Verify no torn reads were observed
+    size_t bad_size_count = bad_size.load(std::memory_order_acquire);
+    size_t torn_reads_count = torn_reads.load(std::memory_order_acquire);
+    CATCH_INFO("bad_size=" << bad_size_count << ", torn_reads=" << torn_reads_count);
+    CATCH_REQUIRE(bad_size_count == 0);
+    CATCH_REQUIRE(torn_reads_count == 0);
 }
 
 CATCH_TEST_CASE("SeqlockVisitor retries on validation failure", "[graphs][seqlock]") {
