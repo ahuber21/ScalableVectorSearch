@@ -101,12 +101,16 @@ using GrowStableData = svs::data::SimpleData<
     svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>>;
 using NonGrowStableData = svs::data::SimpleData<float, svs::Dynamic>;
 
+static_assert(svs::data::is_dataset_grow_stable_v<GrowStableData>);
+static_assert(!svs::data::is_dataset_grow_stable_v<NonGrowStableData>);
+
 // Accepted: SeqlockSync over grow-stable dataset.
 using AcceptedSeqlock = vamana::MutableVamanaIndex<
     TestGraph,
     GrowStableData,
     svs::distance::DistanceL2,
     vamana::SeqlockSync>;
+static_assert(sizeof(AcceptedSeqlock) > 0);
 
 // Accepted: SequentialSync over non-grow-stable dataset (default path).
 using AcceptedSequential = vamana::MutableVamanaIndex<
@@ -114,8 +118,10 @@ using AcceptedSequential = vamana::MutableVamanaIndex<
     NonGrowStableData,
     svs::distance::DistanceL2,
     vamana::SequentialSync>;
+static_assert(sizeof(AcceptedSequential) > 0);
 
-// Rejected: SeqlockSync over non-grow-stable dataset (demonstrated in scratch file).
+// Rejected: SeqlockSync over non-grow-stable dataset, a static_assert failure that cannot
+// be exercised from a translation unit that must compile.
 
 // The whole point of NullMutex is that a member costs nothing.
 struct WithNullMutex {
