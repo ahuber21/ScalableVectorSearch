@@ -61,6 +61,73 @@ CATCH_TEST_CASE("SeqLockCounter single-threaded", "[core][seqlock]") {
         // No write occurred.
         CATCH_REQUIRE(counter.read_validate(*read_seq) == true);
     }
+
+    CATCH_SECTION("read_validate rejects large numbers of intervening writes") {
+        // Regression test: ensure counter width is large enough that wrap-around
+        // cannot occur in practice. Narrow widths (e.g., uint8_t) allow the counter
+        // to return to its original value after a multiple of 2^(width-1) writes,
+        // causing read_validate to incorrectly accept a torn read.
+        auto read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+
+        // 128 writes (2^7) would wrap an 8-bit counter; must still reject.
+        for (int i = 0; i < 128; ++i) {
+            auto w = counter.begin_write();
+            counter.end_write(w);
+        }
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == false);
+
+        // Reset for next check.
+        counter = svs::SeqLockCounter();
+        read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+
+        // 256 writes (2^8) would wrap an 8-bit counter; must still reject.
+        for (int i = 0; i < 256; ++i) {
+            auto w = counter.begin_write();
+            counter.end_write(w);
+        }
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == false);
+
+        // Reset for next check.
+        counter = svs::SeqLockCounter();
+        read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+
+        // 65536 writes (2^16) would wrap a 16-bit counter; must still reject.
+        for (int i = 0; i < 65536; ++i) {
+            auto w = counter.begin_write();
+            counter.end_write(w);
+        }
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == false);
+
+        // Positive controls: small counts should still reject.
+        counter = svs::SeqLockCounter();
+        read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+
+        // Single write must be detected.
+        auto w = counter.begin_write();
+        counter.end_write(w);
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == false);
+
+        // Two writes must be detected.
+        counter = svs::SeqLockCounter();
+        read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+
+        for (int i = 0; i < 2; ++i) {
+            auto wt = counter.begin_write();
+            counter.end_write(wt);
+        }
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == false);
+
+        // Zero intervening writes: validation should succeed.
+        counter = svs::SeqLockCounter();
+        read_seq = counter.read_begin();
+        CATCH_REQUIRE(read_seq.has_value());
+        CATCH_REQUIRE(counter.read_validate(*read_seq) == true);
+    }
 }
 
 CATCH_TEST_CASE("SeqLockCounter concurrent reader and writer", "[core][seqlock]") {

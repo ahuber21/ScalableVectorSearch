@@ -29,15 +29,16 @@ namespace svs {
 ///
 /// @brief Per-element sequence lock counter for reader-writer synchronization.
 ///
-/// Uses a uint8_t counter: odd values indicate a write in progress, even values indicate
-/// a stable state.
+/// Uses a uint32_t counter: odd values indicate a write in progress, even values indicate
+/// a stable state. A 32-bit counter requires 2^31 completed writes within one reader's
+/// critical section to wrap, preventing `read_validate` from falsely accepting a torn read.
 ///
 /// **Writer-writer serialization is the caller's responsibility.** Only one writer
 /// at a time may call ``begin_write``/``end_write`` on a given counter. Use an external
 /// lock (e.g., per-node ``SpinLock``) to serialize concurrent writers to the same element.
 ///
 class SeqLockCounter {
-    using counter_type = uint8_t;
+    using counter_type = uint32_t;
 
   public:
     SeqLockCounter() = default;
