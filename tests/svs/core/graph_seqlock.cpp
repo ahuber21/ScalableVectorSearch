@@ -134,8 +134,7 @@ CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock]") {
 
     constexpr size_t num_readers = 4;
 #ifdef __SANITIZE_THREAD__
-    constexpr size_t iterations_tsan = 100;
-    constexpr size_t iterations = iterations_tsan;
+    constexpr size_t iterations = 100;
 #else
     constexpr size_t iterations = 10000;
 #endif
