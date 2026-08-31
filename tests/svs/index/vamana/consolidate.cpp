@@ -27,7 +27,15 @@
 // catch2
 #include "catch2/catch_test_macros.hpp"
 
+// stdlib
+#include <concepts>
+#include <functional>
+#include <vector>
+
 namespace {
+
+template <typename G>
+concept HasReverseEdges = requires(G& g) { g.reverse_edges(); };
 
 template <typename Graph, typename Predicate>
 void check_post_conditions(const Graph& graph, Predicate&& predicate) {
@@ -56,6 +64,14 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
     auto graph = test_dataset::graph();
     auto data = test_dataset::data_f32();
     auto threadpool = svs::threads::DefaultThreadPool(2);
+
+    CATCH_SECTION("Partial Consolidation Requires Reverse Edges") {
+        // Verify that SimpleGraph does not satisfy the reverse edges requirement.
+        // The partial consolidation operator() should not be callable for SimpleGraph.
+        using Graph = decltype(graph);
+
+        CATCH_REQUIRE(!HasReverseEdges<Graph>);
+    }
 
     CATCH_SECTION("Remove Even Nodes") {
         auto tic = svs::lib::now();

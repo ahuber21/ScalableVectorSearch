@@ -22,6 +22,8 @@
 #include "svs/index/vamana/extensions.h"
 #include "svs/index/vamana/prune.h"
 #include "svs/lib/array.h"
+#include "svs/lib/narrow.h"
+#include "svs/lib/reverse_edges.h"
 #include "svs/lib/threads.h"
 #include "svs/lib/timing.h"
 
@@ -29,6 +31,7 @@
 #include "tsl/robin_set.h"
 
 // stdlib
+#include <numeric>
 #include <span>
 #include <unordered_set>
 
@@ -228,9 +231,9 @@ class GraphConsolidator {
         std::sort(valid_candidates.begin(), valid_candidates.end(), Compare{});
     }
 
-    template <typename Deleted>
+    template <typename GlobalIds, typename Deleted>
     void generate_updates(
-        const threads::UnitRange<size_t>& global_ids,
+        const GlobalIds& global_ids,
         const threads::UnitRange<size_t>& local_ids,
         BulkUpdate<I>& update_buffer,
         ConsolidateThreadLocal<I>& tls,
@@ -290,9 +293,10 @@ class GraphConsolidator {
     ///
     /// Write pending updates to the graph.
     ///
+    template <typename GlobalIds>
     void apply_updates(
         BulkUpdate<I>& update_buffer,
-        const threads::UnitRange<size_t>& global_ids,
+        const GlobalIds& global_ids,
         const threads::UnitRange<size_t>& local_ids
     ) {
         for (auto i : local_ids) {
@@ -302,25 +306,31 @@ class GraphConsolidator {
         }
     }
 
-    template <typename Delete> void operator()(const Delete& is_deleted) {
-        // Allocate necessary scratch space.
-        BulkUpdate<I> update_buffer{params_.update_batch_size, params_.prune_to};
-        threads::SequentialTLS<ConsolidateThreadLocal<I>> tls{threadpool_.size()};
-
-        const size_t num_nodes = graph_.n_nodes();
-        const size_t update_batch_size = std::min(params_.update_batch_size, num_nodes);
+  private:
+    ///
+    /// Run the generate/apply driver over an explicit set of work node IDs.
+    /// Batches the work and processes each batch with parallel generate/apply phases.
+    ///
+    template <typename WorkIds, typename Deleted>
+    void run_driver(const WorkIds& work_ids, const Deleted& is_deleted) {
+        const size_t num_work = work_ids.size();
+        const size_t update_batch_size = std::min(params_.update_batch_size, num_work);
         const size_t thread_batch_size = 500;
 
-        size_t start = 0;
-        while (start < num_nodes) {
-            size_t stop = std::min(num_nodes, start + update_batch_size);
+        BulkUpdate<I> update_buffer{update_batch_size, params_.prune_to};
+        threads::SequentialTLS<ConsolidateThreadLocal<I>> tls{threadpool_.size()};
 
-            // Generate updates.
+        size_t start = 0;
+        while (start < num_work) {
+            size_t stop = std::min(num_work, start + update_batch_size);
+            auto global_ids =
+                std::span<const size_t>(work_ids).subspan(start, stop - start);
+            threads::UnitRange<size_t> local_range{0, global_ids.size()};
+
             update_buffer.prepare();
-            threads::UnitRange global_ids{start, stop};
             threads::parallel_for(
                 threadpool_,
-                threads::DynamicPartition{global_ids.eachindex(), thread_batch_size},
+                threads::DynamicPartition{local_range, thread_batch_size},
                 [&](const auto& local_ids, uint64_t tid) {
                     auto& thread_local_scratch = tls.at(tid);
                     generate_updates(
@@ -333,18 +343,51 @@ class GraphConsolidator {
                 }
             );
 
-            // Write back results.
             threads::parallel_for(
                 threadpool_,
-                threads::DynamicPartition{global_ids.eachindex(), thread_batch_size},
+                threads::DynamicPartition{local_range, thread_batch_size},
                 [&](const auto& local_ids, uint64_t /*tid*/) {
                     apply_updates(update_buffer, global_ids, threads::UnitRange(local_ids));
                 }
             );
 
-            // Prepare for the next iteration.
             start = stop;
         }
+    }
+
+  public:
+    template <typename Deleted> void operator()(const Deleted& is_deleted) {
+        const size_t num_nodes = graph_.n_nodes();
+        std::vector<size_t> all_ids(num_nodes);
+        std::iota(all_ids.begin(), all_ids.end(), size_t{0});
+        run_driver(all_ids, is_deleted);
+    }
+
+    ///
+    /// Partial consolidation: process only nodes affected by the deleted set.
+    /// Requires graph to provide reverse edges for discovering in-neighbors.
+    ///
+    template <typename DeletedSet, typename Deleted>
+        requires requires(Graph& g) {
+                     { g.reverse_edges() } -> std::convertible_to<lib::ReverseEdges<I>*>;
+                 }
+    void operator()(const DeletedSet& deleted_ids, const Deleted& is_deleted) {
+        auto* reverse_edges = graph_.reverse_edges();
+        assert(reverse_edges != nullptr);
+
+        tsl::robin_set<size_t> work{};
+        for (auto d : deleted_ids) {
+            const auto& neighbors = graph_.get_node(lib::narrow_cast<I>(d));
+            for (auto a : neighbors) {
+                if (!is_deleted(a)) {
+                    work.insert(a);
+                }
+            }
+            reverse_edges->collect(lib::narrow_cast<I>(d), work, is_deleted);
+        }
+
+        std::vector<size_t> work_ids(work.begin(), work.end());
+        run_driver(work_ids, is_deleted);
     }
 };
 
