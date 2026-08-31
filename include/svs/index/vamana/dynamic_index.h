@@ -390,7 +390,7 @@ class MutableVamanaIndex {
         // approximate the storage as the id pair held in each of the two directions. This
         // ignores the maps' load-factor slack and control bytes, so it is an estimate of
         // the hash-map overhead that is accurate to within a few percent.
-        metadata_bytes += 2 * translator_.size() *
+        metadata_bytes += 2 * size() *
                           (sizeof(IDTranslator::external_id_type) +
                            sizeof(IDTranslator::internal_id_type));
         usage.metadata_bytes = metadata_bytes;
@@ -434,6 +434,10 @@ class MutableVamanaIndex {
     // Unsafe translate_internal_id: caller must hold translator_mutex_.
     // Calling unlocked races with concurrent translator rewrites.
     size_t unsafe_translate_internal_id(Idx i) const { return translator_.get_external(i); }
+
+    // Unsafe size: caller must hold translator_mutex_.
+    // Calling unlocked races with concurrent translator rewrites.
+    size_t unsafe_size() const { return translator_.size(); }
 
   public:
     ///
@@ -494,9 +498,10 @@ class MutableVamanaIndex {
 
     /// @brief Return the number of **valid** (non-deleted) entries in the index.
     size_t size() const {
-        // NB: Index translation should always be kept in-sync with the number of valid
-        // elements.
-        return translator_.size();
+        // NB: Under policies with deferred translator cleanup, soft-deleted entries remain
+        // in the translator until consolidation, so this count over-reports in that case.
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
+        return unsafe_size();
     }
 
     ///
@@ -1489,7 +1494,9 @@ class MutableVamanaIndex {
             std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
             if (!unsafe_has_id(external_id)) {
                 throw ANNEXCEPTION(
-                    "ID {} is out of bounds for index of size {}!", external_id, size()
+                    "ID {} is out of bounds for index of size {}!",
+                    external_id,
+                    unsafe_size()
                 );
             }
         }
