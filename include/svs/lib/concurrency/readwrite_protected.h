@@ -61,6 +61,7 @@ template <typename T> class ReadWriteProtected {
             return *this;
         }
         set(other.get());
+        return *this;
     }
 
     /// @brief Move construction by move-assigning the shared object.
