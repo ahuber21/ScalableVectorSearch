@@ -94,6 +94,29 @@ struct BadVisitor {
 static_assert(vamana::SyncPolicy<BadVisitor>);
 static_assert(!vamana::SyncPolicyFor<BadVisitor, TestGraph>);
 
+// Growth constraint: SeqlockSync requires grow-stable datasets; SequentialSync accepts any.
+using GrowStableData = svs::data::SimpleData<
+    float,
+    svs::Dynamic,
+    svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>>;
+using NonGrowStableData = svs::data::SimpleData<float, svs::Dynamic>;
+
+// Accepted: SeqlockSync over grow-stable dataset.
+using AcceptedSeqlock = vamana::MutableVamanaIndex<
+    TestGraph,
+    GrowStableData,
+    svs::distance::DistanceL2,
+    vamana::SeqlockSync>;
+
+// Accepted: SequentialSync over non-grow-stable dataset (default path).
+using AcceptedSequential = vamana::MutableVamanaIndex<
+    TestGraph,
+    NonGrowStableData,
+    svs::distance::DistanceL2,
+    vamana::SequentialSync>;
+
+// Rejected: SeqlockSync over non-grow-stable dataset (demonstrated in scratch file).
+
 // The whole point of NullMutex is that a member costs nothing.
 struct WithNullMutex {
     [[no_unique_address]] svs::lib::NullMutex mutex_{};
