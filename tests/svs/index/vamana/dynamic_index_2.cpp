@@ -249,13 +249,8 @@ void test_loop(
     }
 }
 
-namespace {
-template <typename Graph, typename Data, typename Sync>
-void test_graph_index_impl(
-    const std::vector<std::string>& captured_logs,
-    const std::vector<svs::logging::Level>& captured_levels,
-    bool check_logging
-) {
+CATCH_TEST_CASE("Testing Graph Index", "[graph_index][dynamic_index]") {
+    // Set hyper parameters here
     const size_t max_degree = 64;
 #if defined(NDEBUG)
     const float initial_fraction = 0.25;
@@ -267,7 +262,30 @@ void test_graph_index_impl(
     const size_t num_threads = 10;
     const float alpha = 1.2;
 
-    auto test_logger = svs::logging::get();
+    // Set up log
+    std::vector<std::string> captured_logs;
+    std::vector<svs::logging::Level> captured_levels;
+
+    auto callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&captured_logs, &captured_levels](const spdlog::details::log_msg& msg) {
+            captured_logs.emplace_back(msg.payload.data(), msg.payload.size());
+            captured_levels.push_back(svs::logging::detail::from_spdlog(msg.level));
+        }
+    );
+    callback_sink->set_level(spdlog::level::trace);
+    auto test_logger = std::make_shared<spdlog::logger>("test_logger", callback_sink);
+    test_logger->set_level(spdlog::level::trace);
+    std::vector<std::string> global_captured_logs;
+    auto global_callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&global_captured_logs](const spdlog::details::log_msg& msg) {
+            global_captured_logs.emplace_back(msg.payload.data(), msg.payload.size());
+        }
+    );
+    global_callback_sink->set_level(spdlog::level::trace);
+    auto original_logger = svs::logging::get();
+    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
+
+    // Load the base dataset and queries.
     auto data = svs::data::SimpleData<Eltype, N>::load(test_dataset::data_svs_file());
     auto data_copy = data;
     auto num_points = data.size();
@@ -285,11 +303,14 @@ void test_graph_index_impl(
     );
 
     auto num_indices_to_add = div(reference.size(), initial_fraction);
+    std::cout << "Initializing with " << num_indices_to_add << " entries!\n";
 
-    auto data_mutable = Data(num_indices_to_add, N);
+    // Construct a blocked dataset consisting of 50% of the base dataset.
+    auto data_mutable = svs::data::BlockedData<Eltype, N>(num_indices_to_add, N);
     std::vector<Idx> initial_indices{};
     {
         auto [vectors, indices] = reference.generate(num_indices_to_add);
+        // Copy assign ``initial_indices``
         auto num_points_added = indices.size();
         CATCH_REQUIRE(vectors.size() == num_points_added);
         CATCH_REQUIRE(num_points_added <= num_indices_to_add);
@@ -309,7 +330,7 @@ void test_graph_index_impl(
         1.2, max_degree, 2 * max_degree, 1000, max_degree - 4, true};
 
     auto tic = svs::lib::now();
-    auto index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Distance, Sync>(
+    auto index = svs::index::vamana::MutableVamanaIndex(
         parameters,
         std::move(data_mutable),
         initial_indices,
@@ -320,24 +341,22 @@ void test_graph_index_impl(
     double build_time = svs::lib::time_difference(tic);
     index.debug_check_invariants(false);
 
-    if (check_logging) {
-        CATCH_REQUIRE(captured_logs[0].find("Total / % Measured:") != std::string::npos);
-        CATCH_REQUIRE(captured_levels[0] == svs::logging::Level::Debug);
-        CATCH_REQUIRE(
-            captured_logs[1].find("Vamana Build Parameters:") != std::string::npos
-        );
-        CATCH_REQUIRE(captured_levels[1] == svs::logging::Level::Debug);
-        CATCH_REQUIRE(captured_logs[2].find("Number of syncs:") != std::string::npos);
-        CATCH_REQUIRE(captured_levels[2] == svs::logging::Level::Trace);
-        CATCH_REQUIRE(captured_logs[3].find("Batch Size:") != std::string::npos);
-        CATCH_REQUIRE(captured_levels[3] == svs::logging::Level::Trace);
-    }
+    CATCH_REQUIRE(captured_logs[0].find("Total / % Measured:") != std::string::npos);
+    CATCH_REQUIRE(captured_levels[0] == svs::logging::Level::Debug);
+    CATCH_REQUIRE(captured_logs[1].find("Vamana Build Parameters:") != std::string::npos);
+    CATCH_REQUIRE(captured_levels[1] == svs::logging::Level::Debug);
+    CATCH_REQUIRE(captured_logs[2].find("Number of syncs:") != std::string::npos);
+    CATCH_REQUIRE(captured_levels[2] == svs::logging::Level::Trace);
+    CATCH_REQUIRE(captured_logs[3].find("Batch Size:") != std::string::npos);
+    CATCH_REQUIRE(captured_levels[3] == svs::logging::Level::Trace);
 
+    // Test get_distance functionality
     svs::DistanceDispatcher dispatcher(svs::L2);
     dispatcher([&](auto dist) {
         svs_test::GetDistanceTester::test(index, dist, data_copy, initial_indices);
     });
 
+    // Verify that we can get and set build parameters.
     CATCH_REQUIRE(index.get_alpha() == alpha);
     index.set_alpha(1.0);
     CATCH_REQUIRE(index.get_alpha() == 1.0);
@@ -378,42 +397,79 @@ void test_graph_index_impl(
     );
 
     test_loop(index, reference, queries, div(reference.size(), modify_fraction), 2, 6);
-}
-} // namespace
 
-CATCH_TEST_CASE("Testing Graph Index", "[graph_index][dynamic_index]") {
-    std::vector<std::string> captured_logs;
-    std::vector<svs::logging::Level> captured_levels;
+    // Try saving the index.
+    svs_test::prepare_temp_directory();
+    auto tmp = svs_test::temp_directory();
+    index.save(tmp / "config", tmp / "graph", tmp / "data");
 
-    auto callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
-        [&captured_logs, &captured_levels](const spdlog::details::log_msg& msg) {
-            captured_logs.emplace_back(msg.payload.data(), msg.payload.size());
-            captured_levels.push_back(svs::logging::detail::from_spdlog(msg.level));
-        }
+    auto reloaded = svs::index::vamana::auto_dynamic_assemble(
+        tmp / "config",
+        SVS_LAZY(svs::graphs::SimpleBlockedGraph<uint32_t>::load(tmp / "graph")),
+        SVS_LAZY(svs::data::BlockedData<float>::load(tmp / "data")),
+        svs::DistanceL2(),
+        2
     );
-    callback_sink->set_level(spdlog::level::trace);
-    auto test_logger = std::make_shared<spdlog::logger>("test_logger", callback_sink);
-    test_logger->set_level(spdlog::level::trace);
-    std::vector<std::string> global_captured_logs;
-    auto global_callback_sink = std::make_shared<spdlog::sinks::callback_sink_mt>(
-        [&global_captured_logs](const spdlog::details::log_msg& msg) {
-            global_captured_logs.emplace_back(msg.payload.data(), msg.payload.size());
-        }
+
+    do_check(
+        reloaded,
+        reference,
+        queries,
+        build_time,
+        stringify("initial build (", num_indices_to_add, ") points"),
+        true
     );
-    global_callback_sink->set_level(spdlog::level::trace);
-    auto original_logger = svs::logging::get();
-    svs_test::ScopedGlobalSink scoped_sink(original_logger, global_callback_sink);
 
-    svs::logging::set(test_logger);
+    reloaded = svs::index::vamana::auto_dynamic_assemble(
+        tmp / "config",
+        SVS_LAZY(svs::graphs::SimpleBlockedGraph<uint32_t>::load(tmp / "graph")),
+        SVS_LAZY(svs::data::BlockedData<float>::load(tmp / "data")),
+        svs::DistanceL2(),
+        svs::threads::CppAsyncThreadPool(2)
+    );
 
-    using Graph = svs::graphs::SimpleBlockedGraph<uint32_t>;
-    using Data = svs::data::BlockedData<float>;
-    using Sync = svs::index::vamana::SequentialSync;
-    test_graph_index_impl<Graph, Data, Sync>(captured_logs, captured_levels, true);
+    do_check(
+        reloaded,
+        reference,
+        queries,
+        build_time,
+        stringify("initial build (", num_indices_to_add, ") points"),
+        true
+    );
+
+    reloaded = svs::index::vamana::auto_dynamic_assemble(
+        tmp / "config",
+        SVS_LAZY(svs::graphs::SimpleBlockedGraph<uint32_t>::load(tmp / "graph")),
+        SVS_LAZY(svs::data::BlockedData<float>::load(tmp / "data")),
+        svs::DistanceL2(),
+        svs::threads::QueueThreadPoolWrapper(2)
+    );
+
+    do_check(
+        reloaded,
+        reference,
+        queries,
+        build_time,
+        stringify("initial build (", num_indices_to_add, ") points"),
+        true
+    );
+
+    // Make sure parameters were saved across the saving.
+    CATCH_REQUIRE(index.get_alpha() == reloaded.get_alpha());
+    CATCH_REQUIRE(index.get_graph_max_degree() == reloaded.get_graph_max_degree());
+    CATCH_REQUIRE(index.get_max_candidates() == reloaded.get_max_candidates());
+    CATCH_REQUIRE(
+        index.get_construction_window_size() == reloaded.get_construction_window_size()
+    );
+    CATCH_REQUIRE(index.get_prune_to() == reloaded.get_prune_to());
+    CATCH_REQUIRE(index.get_full_search_history() == reloaded.get_full_search_history());
+    CATCH_REQUIRE(index.size() == reloaded.size());
+    // ID's preserved across runs.
+    index.on_ids([&](size_t e) { CATCH_REQUIRE(reloaded.has_id(e)); });
+
     CATCH_REQUIRE(global_captured_logs.empty());
-
-    svs::logging::set(original_logger);
 }
+
 CATCH_TEST_CASE("Dynamic MutableVamanaIndex Per-Index Logging Test", "[logging]") {
     // Vector to store captured log messages
     std::vector<std::string> captured_logs;
