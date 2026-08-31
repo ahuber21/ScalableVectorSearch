@@ -518,6 +518,88 @@ CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index
     CATCH_REQUIRE(usage == expected_total_bytes);
 }
 
+namespace {
+// Check structural graph invariants.
+template <typename Index> void check_graph_invariants(const Index& index) {
+    const auto& graph = index.view_graph();
+    const size_t max_degree = index.get_graph_max_degree();
+    const size_t graph_size = graph.n_nodes();
+
+    size_t over_degree_count = 0;
+    size_t over_degree_first_node = 0;
+    size_t over_degree_first_value = 0;
+
+    size_t out_of_range_count = 0;
+    size_t out_of_range_first_node = 0;
+    size_t out_of_range_first_value = 0;
+
+    size_t duplicate_count = 0;
+    size_t duplicate_first_node = 0;
+    size_t duplicate_first_value = 0;
+
+    size_t zero_degree_count = 0;
+
+    std::unordered_set<size_t> seen;
+    for (size_t node_id = 0; node_id < graph_size; ++node_id) {
+        auto neighbors = graph.get_node(node_id);
+        const size_t degree = neighbors.size();
+
+        if (degree > max_degree) {
+            if (over_degree_count == 0) {
+                over_degree_first_node = node_id;
+                over_degree_first_value = degree;
+            }
+            ++over_degree_count;
+        }
+
+        if (degree == 0) {
+            ++zero_degree_count;
+        }
+
+        seen.clear();
+        for (auto neighbor_id : neighbors) {
+            if (neighbor_id >= graph_size) {
+                if (out_of_range_count == 0) {
+                    out_of_range_first_node = node_id;
+                    out_of_range_first_value = neighbor_id;
+                }
+                ++out_of_range_count;
+            }
+
+            if (seen.find(neighbor_id) != seen.end()) {
+                if (duplicate_count == 0) {
+                    duplicate_first_node = node_id;
+                    duplicate_first_value = neighbor_id;
+                }
+                ++duplicate_count;
+            }
+            seen.insert(neighbor_id);
+        }
+    }
+
+    CATCH_INFO(
+        "First over-degree node: " << over_degree_first_node << " (degree "
+                                   << over_degree_first_value << " > " << max_degree << ")"
+    );
+    CATCH_REQUIRE(over_degree_count == 0);
+
+    CATCH_INFO(
+        "First out-of-range neighbor: node " << out_of_range_first_node << " -> "
+                                             << out_of_range_first_value
+                                             << " (>= " << graph_size << ")"
+    );
+    CATCH_REQUIRE(out_of_range_count == 0);
+
+    CATCH_INFO(
+        "First duplicate neighbor: node " << duplicate_first_node << " contains duplicate "
+                                          << duplicate_first_value
+    );
+    CATCH_REQUIRE(duplicate_count == 0);
+
+    CATCH_REQUIRE(zero_degree_count == 0);
+}
+} // namespace
+
 CATCH_TEST_CASE(
     "MutableVamana Index SeqlockSync Instantiation", "[index][vamana][sync_policy]"
 ) {
@@ -596,6 +678,9 @@ CATCH_TEST_CASE(
         auto index2 =
             SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{1});
 
+        check_graph_invariants(index1);
+        check_graph_invariants(index2);
+
         auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
         auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
 
@@ -618,6 +703,9 @@ CATCH_TEST_CASE(
             SeqIndex(parameters, std::move(data1), indices, Distance(), size_t{2});
         auto index2 =
             SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{2});
+
+        check_graph_invariants(index1);
+        check_graph_invariants(index2);
 
         auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
         auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
@@ -642,6 +730,9 @@ CATCH_TEST_CASE(
         auto seqlock_index = SeqlockIndex(
             parameters, std::move(data_seqlock), indices, Distance(), size_t{1}
         );
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
 
         auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
         auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
@@ -674,6 +765,9 @@ CATCH_TEST_CASE(
 
         CATCH_REQUIRE(seq_index.size() == initial_size);
         CATCH_REQUIRE(seqlock_index.size() == initial_size);
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
 
         auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
         auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
@@ -715,6 +809,9 @@ CATCH_TEST_CASE(
             CATCH_REQUIRE(seqlock_index.has_id(id));
         }
 
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
+
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
@@ -729,6 +826,9 @@ CATCH_TEST_CASE(
             CATCH_REQUIRE(seq_index.is_deleted(id));
             CATCH_REQUIRE(seqlock_index.is_deleted(id));
         }
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
 
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
