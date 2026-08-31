@@ -472,6 +472,8 @@ class VamanaBuilder {
         threads::parallel_for(threadpool_, [&](uint64_t tid) {
             const auto& thread_local_updates = updates.at(tid);
             for (auto [node_id, update] : thread_local_updates) {
+                // Partitioning excludes writers; this guard lets concurrent searchers
+                // detect half-updated adjacency lists and retry.
                 auto guard = graph_.write_guard(node_id);
                 graph_.replace_node(node_id, update);
             }
@@ -496,6 +498,8 @@ class VamanaBuilder {
                 for (auto node_id : is) {
                     for (auto other_id : graph_.get_node(node_id)) {
                         std::lock_guard lock{vertex_locks_[other_id]};
+                        // The mutex above serializes writers; this guard protects
+                        // concurrent searchers from torn reads.
                         auto guard = graph_.write_guard(other_id);
                         if (graph_.get_node_degree(other_id) < params_.graph_max_degree) {
                             graph_.add_edge(other_id, node_id);
@@ -573,6 +577,8 @@ class VamanaBuilder {
                             lib::as_const_span(candidates),
                             pruned_results
                         );
+                        // Bucket partitioning excludes other writers; this guard lets
+                        // concurrent searchers detect torn reads.
                         auto guard = graph_.write_guard(src);
                         graph_.replace_node(src, pruned_results);
                     }
