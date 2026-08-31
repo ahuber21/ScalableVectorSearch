@@ -24,6 +24,9 @@
 #include "catch2/catch_test_macros.hpp"
 
 // stl
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -189,5 +192,107 @@ CATCH_TEST_CASE("Sync Policy Counters", "[index][vamana][sync_policy]") {
             thread.join();
         }
         CATCH_REQUIRE(counter.load() == (num_threads - 1) * per_thread + per_thread - 1);
+    }
+}
+
+CATCH_TEST_CASE("MovableMutex", "[index][vamana][sync_policy]") {
+    using MovableMutex = svs::lib::MovableMutex<std::shared_mutex>;
+
+    CATCH_SECTION("Exclusive lock prevents concurrent try_lock") {
+        auto mutex = MovableMutex{};
+        mutex.lock();
+        CATCH_REQUIRE(!mutex.try_lock());
+        mutex.unlock();
+        CATCH_REQUIRE(mutex.try_lock());
+        mutex.unlock();
+    }
+
+    CATCH_SECTION("Shared lock prevents exclusive lock") {
+        auto mutex = MovableMutex{};
+        auto shared = std::shared_lock<MovableMutex>{mutex};
+        CATCH_REQUIRE(!mutex.try_lock());
+    }
+
+    CATCH_SECTION("Exclusive lock prevents shared lock") {
+        auto mutex = MovableMutex{};
+        mutex.lock();
+        CATCH_REQUIRE(!mutex.try_lock_shared());
+        mutex.unlock();
+        CATCH_REQUIRE(mutex.try_lock_shared());
+        mutex.unlock_shared();
+    }
+
+    CATCH_SECTION("Two threads can hold shared locks concurrently") {
+        constexpr size_t max_spins = 100'000;
+        auto mutex = MovableMutex{};
+        auto both_succeeded = std::atomic<bool>{false};
+        auto thread1_acquired = std::atomic<bool>{false};
+        auto thread2_acquired = std::atomic<bool>{false};
+        auto timeout1 = std::atomic<bool>{false};
+        auto timeout2 = std::atomic<bool>{false};
+
+        auto t1 = std::thread{[&]() {
+            CATCH_REQUIRE(mutex.try_lock_shared());
+            thread1_acquired.store(true, std::memory_order_release);
+
+            for (size_t i = 0; i < max_spins; ++i) {
+                if (thread2_acquired.load(std::memory_order_acquire)) {
+                    both_succeeded.store(true, std::memory_order_release);
+                    mutex.unlock_shared();
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            timeout1.store(true, std::memory_order_release);
+            mutex.unlock_shared();
+        }};
+
+        auto t2 = std::thread{[&]() {
+            for (size_t i = 0; i < max_spins; ++i) {
+                if (thread1_acquired.load(std::memory_order_acquire)) {
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (!thread1_acquired.load(std::memory_order_acquire)) {
+                timeout2.store(true, std::memory_order_release);
+                return;
+            }
+
+            CATCH_REQUIRE(mutex.try_lock_shared());
+            thread2_acquired.store(true, std::memory_order_release);
+
+            for (size_t i = 0; i < max_spins; ++i) {
+                if (both_succeeded.load(std::memory_order_acquire)) {
+                    mutex.unlock_shared();
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            timeout2.store(true, std::memory_order_release);
+            mutex.unlock_shared();
+        }};
+
+        t1.join();
+        t2.join();
+
+        CATCH_REQUIRE(!timeout1.load());
+        CATCH_REQUIRE(!timeout2.load());
+        CATCH_REQUIRE(both_succeeded.load());
+    }
+
+    CATCH_SECTION("Move construction leaves a valid unlocked mutex") {
+        auto source = MovableMutex{};
+        auto destination = std::move(source);
+        CATCH_REQUIRE(destination.try_lock());
+        destination.unlock();
+    }
+
+    CATCH_SECTION("Move assignment leaves a valid unlocked mutex") {
+        auto source = MovableMutex{};
+        auto destination = MovableMutex{};
+        destination = std::move(source);
+        CATCH_REQUIRE(destination.try_lock());
+        destination.unlock();
     }
 }

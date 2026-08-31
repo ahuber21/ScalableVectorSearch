@@ -20,6 +20,7 @@
 // calls into `distance` that bind their candidate set at definition context.
 #include "svs/core/data/simple.h"
 #include "svs/core/graph/graph.h"
+#include "svs/lib/movable_mutex.h"
 #include "svs/lib/null_mutex.h"
 #include "svs/lib/segmented_vector.h"
 
@@ -159,7 +160,7 @@ struct SequentialSync {
 /// Uses atomic counters, seqlock-protected graph access, segment-stable containers, and
 /// a node visitor that retries on seqlock validation failure.
 struct SeqlockSync {
-    using mutex_type = std::shared_mutex;
+    using mutex_type = lib::MovableMutex<std::shared_mutex>;
     using counter_type = AtomicCounter;
     using graph_access_type = graphs::SeqlockAccess;
     using growth_type = data::SegmentStable;
@@ -185,5 +186,17 @@ static_assert(SyncPolicyFor<
                   uint32_t,
                   data::SimpleData<uint32_t>,
                   graphs::SeqlockAccess>>);
+
+// Both mutex types must be movable so the index can be moved.
+static_assert(std::is_move_constructible_v<SequentialSync::mutex_type>);
+static_assert(std::is_move_assignable_v<SequentialSync::mutex_type>);
+static_assert(std::is_move_constructible_v<SeqlockSync::mutex_type>);
+static_assert(std::is_move_assignable_v<SeqlockSync::mutex_type>);
+
+// The sequential policy's mutex must remain empty for zero overhead.
+static_assert(std::is_empty_v<SequentialSync::mutex_type>);
+
+// A mutex must not be silently copyable.
+static_assert(!std::is_copy_constructible_v<SeqlockSync::mutex_type>);
 
 } // namespace svs::index::vamana
