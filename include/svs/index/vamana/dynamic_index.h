@@ -719,6 +719,41 @@ class MutableVamanaIndex {
         );
     }
 
+  private:
+    // RAII guard to release Pending slots if add_points throws.
+    // Prevents leaking capacity when reservation succeeds but population fails.
+    class PendingSlotGuard {
+        typename Sync::template container_type<SlotMetadata>& status_;
+        const std::vector<size_t>& slots_;
+        bool committed_ = false;
+
+      public:
+        PendingSlotGuard(
+            typename Sync::template container_type<SlotMetadata>& status,
+            const std::vector<size_t>& slots
+        )
+            : status_(status)
+            , slots_(slots) {}
+
+        ~PendingSlotGuard() {
+            if constexpr (Sync::reserves_pending_slots) {
+                if (!committed_) {
+                    for (auto slot : slots_) {
+                        if (status_[slot] == SlotMetadata::Pending) {
+                            status_[slot] = SlotMetadata::Empty;
+                        }
+                    }
+                }
+            }
+        }
+
+        void commit() { committed_ = true; }
+
+        PendingSlotGuard(const PendingSlotGuard&) = delete;
+        PendingSlotGuard& operator=(const PendingSlotGuard&) = delete;
+    };
+
+  public:
     ///
     /// @brief Add the points with the given external IDs to the dataset.
     //
@@ -801,6 +836,9 @@ class MutableVamanaIndex {
         }
         assert(slots.size() == num_points);
 
+        // RAII guard releases Pending slots if any subsequent operation throws.
+        PendingSlotGuard guard(status_, slots);
+
         // Try to update the id translation now that we have internal ids.
         // If this fails, we still haven't mutated the index data structure so we're safe
         // to throw an exception.
@@ -837,11 +875,18 @@ class MutableVamanaIndex {
         builder.construct(alpha_, entry_point(), slots, logging::Level::Trace, logger_);
 
         // Mark all added entries as valid.
-        // When reserves_pending_slots=true this promotes from Pending; otherwise from
-        // Empty.
+        // When reserves_pending_slots=true, only promote slots still Pending; a slot
+        // deleted mid-populate stays Deleted so the delete wins.
         for (const auto& i : slots) {
-            status_[i] = SlotMetadata::Valid;
+            if constexpr (Sync::reserves_pending_slots) {
+                if (status_[i] == SlotMetadata::Pending) {
+                    status_[i] = SlotMetadata::Valid;
+                }
+            } else {
+                status_[i] = SlotMetadata::Valid;
+            }
         }
+        guard.commit();
 
         if (!slots.empty()) {
             first_empty_.fetch_max(slots.back() + 1);
@@ -887,7 +932,12 @@ class MutableVamanaIndex {
 
     void delete_entry(size_t i) {
         SlotMetadata& meta = getindex(status_, i);
-        assert(meta == SlotMetadata::Valid);
+        if constexpr (Sync::reserves_pending_slots) {
+            // Pending slots can be deleted (races with concurrent add_points).
+            assert(meta == SlotMetadata::Valid || meta == SlotMetadata::Pending);
+        } else {
+            assert(meta == SlotMetadata::Valid);
+        }
         meta = SlotMetadata::Deleted;
     }
 
