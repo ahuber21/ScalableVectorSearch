@@ -381,39 +381,40 @@ CATCH_TEST_CASE(
     }
 }
 
-CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
-    using SeqSync = svs::index::vamana::SequentialSync;
-
-    // Static assertions: guards are [[nodiscard]] and mutex type is empty under
-    // SequentialSync.
-    static_assert(std::is_empty_v<SeqSync::mutex_type>, "NullMutex must be empty");
-    static_assert(std::is_empty_v<svs::lib::NullMutex>, "NullMutex must be empty");
-
-    // Runtime: build a small index and exercise the locking accessors.
+namespace {
+template <typename Graph, typename Data, typename Sync> void test_locking_impl() {
     const size_t num_threads = 2;
     using Distance = svs::distance::DistanceL2;
-    auto data = test_dataset::data_blocked_f32();
+    using Index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Distance, Sync>;
+
+    static_assert(std::is_same_v<
+                  decltype(std::declval<const Index&>().lock_for_search()),
+                  std::shared_lock<typename Sync::mutex_type>>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<const Index&>().lock_for_translation()),
+                  std::shared_lock<typename Sync::mutex_type>>);
+
+    auto source_data = test_dataset::data_f32();
+    auto data = Data(source_data.size(), source_data.dimensions());
+    for (size_t i = 0; i < source_data.size(); ++i) {
+        data.set_datum(i, source_data.get_datum(i));
+    }
     std::vector<size_t> indices(data.size());
     std::iota(indices.begin(), indices.end(), 0);
 
     svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
-    auto index = svs::index::vamana::MutableVamanaIndex(
-        parameters, std::move(data), indices, Distance(), num_threads
-    );
+    auto index = Index(parameters, std::move(data), indices, Distance(), num_threads);
 
-    // Take and release search lock.
     {
         auto lock = index.lock_for_search();
-        CATCH_REQUIRE(true); // Lock acquired successfully.
+        CATCH_REQUIRE(lock.owns_lock());
     }
 
-    // Take and release translation lock.
     {
         auto lock = index.lock_for_translation();
-        CATCH_REQUIRE(true); // Lock acquired successfully.
+        CATCH_REQUIRE(lock.owns_lock());
     }
 
-    // Perform a search and verify results are correct.
     const size_t num_neighbors = 10;
     auto queries = test_dataset::queries();
     auto groundtruth = test_dataset::groundtruth_euclidean();
@@ -422,39 +423,59 @@ CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
     auto results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
     index.search(results.view(), queries.cview(), search_params);
 
-    // Verify recall is reasonable.
     auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
-    CATCH_REQUIRE(recall > 0.0); // Should have some recall.
+    CATCH_REQUIRE(recall >= 0.25);
 
-    // Exercise the batch iterator.
     auto query_span =
         std::span<const float>(queries.get_datum(0).data(), queries.dimensions());
     auto iterator = index.make_batch_iterator(query_span);
     CATCH_REQUIRE(iterator.batch_number() == 0);
     CATCH_REQUIRE(!iterator.done());
 
-    // Fetch first batch.
     iterator.next(5);
     CATCH_REQUIRE(iterator.size() <= 5);
     CATCH_REQUIRE(iterator.batch_number() == 1);
 
-    // Collect all neighbors from the first batch.
     std::vector<size_t> batch_ids;
     for (const auto& neighbor : iterator) {
         batch_ids.push_back(neighbor.id());
     }
 
-    // Verify that the batch contains valid external IDs.
     for (const auto& id : batch_ids) {
         CATCH_REQUIRE(index.has_id(id));
     }
 
-    // Fetch another batch and verify it yields different neighbors.
     iterator.next(5);
     CATCH_REQUIRE(iterator.batch_number() == 2);
-    // Iterator should have made progress or be exhausted.
     bool made_progress = (iterator.size() > 0 && iterator.size() <= 5) || iterator.done();
     CATCH_REQUIRE(made_progress);
+}
+} // namespace
+
+CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
+    using SeqSync = svs::index::vamana::SequentialSync;
+    using SeqlockSync = svs::index::vamana::SeqlockSync;
+
+    static_assert(std::is_empty_v<SeqSync::mutex_type>);
+    static_assert(std::is_empty_v<svs::lib::NullMutex>);
+    static_assert(!std::is_empty_v<SeqlockSync::mutex_type>);
+    static_assert(!std::is_empty_v<svs::lib::MovableMutex<std::shared_mutex>>);
+
+    CATCH_SECTION("SequentialSync") {
+        using Graph = svs::graphs::SimpleBlockedGraph<uint32_t>;
+        using Data = svs::data::BlockedData<float>;
+        test_locking_impl<Graph, Data, SeqSync>();
+    }
+
+    CATCH_SECTION("SeqlockSync") {
+        using Idx = uint32_t;
+        using Graph = svs::graphs::SimpleGraphBase<
+            Idx,
+            svs::data::SimpleData<Idx, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+        using Data = svs::data::SimpleData<float, svs::Dynamic>;
+        test_locking_impl<Graph, Data, SeqlockSync>();
+    }
 }
 
 CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index]") {
@@ -495,4 +516,334 @@ CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index
     CATCH_REQUIRE(breakdown.total() == expected_total_bytes);
     const size_t usage = index.get_memory_breakdown().total();
     CATCH_REQUIRE(usage == expected_total_bytes);
+}
+
+namespace {
+// Check structural graph invariants.
+template <typename Index> void check_graph_invariants(const Index& index) {
+    const auto& graph = index.view_graph();
+    const size_t max_degree = index.get_graph_max_degree();
+    const size_t graph_size = graph.n_nodes();
+
+    size_t over_degree_count = 0;
+    size_t over_degree_first_node = 0;
+    size_t over_degree_first_value = 0;
+
+    size_t out_of_range_count = 0;
+    size_t out_of_range_first_node = 0;
+    size_t out_of_range_first_value = 0;
+
+    size_t duplicate_count = 0;
+    size_t duplicate_first_node = 0;
+    size_t duplicate_first_value = 0;
+
+    size_t zero_degree_count = 0;
+
+    std::unordered_set<size_t> seen;
+    for (size_t node_id = 0; node_id < graph_size; ++node_id) {
+        auto neighbors = graph.get_node(node_id);
+        const size_t degree = neighbors.size();
+
+        if (degree > max_degree) {
+            if (over_degree_count == 0) {
+                over_degree_first_node = node_id;
+                over_degree_first_value = degree;
+            }
+            ++over_degree_count;
+        }
+
+        if (degree == 0) {
+            ++zero_degree_count;
+        }
+
+        seen.clear();
+        for (auto neighbor_id : neighbors) {
+            if (neighbor_id >= graph_size) {
+                if (out_of_range_count == 0) {
+                    out_of_range_first_node = node_id;
+                    out_of_range_first_value = neighbor_id;
+                }
+                ++out_of_range_count;
+            }
+
+            if (seen.find(neighbor_id) != seen.end()) {
+                if (duplicate_count == 0) {
+                    duplicate_first_node = node_id;
+                    duplicate_first_value = neighbor_id;
+                }
+                ++duplicate_count;
+            }
+            seen.insert(neighbor_id);
+        }
+    }
+
+    CATCH_INFO(
+        "First over-degree node: " << over_degree_first_node << " (degree "
+                                   << over_degree_first_value << " > " << max_degree << ")"
+    );
+    CATCH_REQUIRE(over_degree_count == 0);
+
+    CATCH_INFO(
+        "First out-of-range neighbor: node " << out_of_range_first_node << " -> "
+                                             << out_of_range_first_value
+                                             << " (>= " << graph_size << ")"
+    );
+    CATCH_REQUIRE(out_of_range_count == 0);
+
+    CATCH_INFO(
+        "First duplicate neighbor: node " << duplicate_first_node << " contains duplicate "
+                                          << duplicate_first_value
+    );
+    CATCH_REQUIRE(duplicate_count == 0);
+
+    CATCH_REQUIRE(zero_degree_count == 0);
+}
+} // namespace
+
+CATCH_TEST_CASE(
+    "MutableVamana Index SeqlockSync Instantiation", "[index][vamana][sync_policy]"
+) {
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+    using SharedGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::PlainAccess>;
+    using SharedData = svs::data::SimpleData<float, svs::Dynamic>;
+
+    using SeqSync = svs::index::vamana::SequentialSync;
+    using SeqIndex =
+        svs::index::vamana::MutableVamanaIndex<SharedGraph, SharedData, Distance, SeqSync>;
+
+    using SeqlockSync = svs::index::vamana::SeqlockSync;
+    using SeqlockGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::SeqlockAccess>;
+    using SeqlockIndex = svs::index::vamana::
+        MutableVamanaIndex<SeqlockGraph, SharedData, Distance, SeqlockSync>;
+
+    static_assert(std::is_move_constructible_v<SeqlockIndex>);
+
+    const size_t num_neighbors = 10;
+    auto queries = test_dataset::queries();
+    auto groundtruth = test_dataset::groundtruth_euclidean();
+    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
+    auto search_params = svs::index::vamana::VamanaSearchParameters{};
+    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
+
+    auto compare_results = [&](const char* description,
+                               svs::QueryResult<size_t>& r1,
+                               svs::QueryResult<size_t>& r2,
+                               bool assert_deterministic) {
+        auto recall1 = svs::k_recall_at_n(groundtruth, r1, num_neighbors, num_neighbors);
+        auto recall2 = svs::k_recall_at_n(groundtruth, r2, num_neighbors, num_neighbors);
+
+        size_t differing_queries = 0;
+        size_t total_mismatches = 0;
+        for (size_t q = 0; q < queries.size(); ++q) {
+            bool query_differs = false;
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                if (r2.index(q, i) != r1.index(q, i)) {
+                    ++total_mismatches;
+                    query_differs = true;
+                }
+            }
+            if (query_differs) {
+                ++differing_queries;
+            }
+        }
+
+        CATCH_INFO(
+            description << ": " << differing_queries << "/" << queries.size()
+                        << " queries differ, " << total_mismatches << " total mismatches. "
+                        << "Recall1: " << recall1 << ", Recall2: " << recall2
+        );
+
+        if (assert_deterministic) {
+            CATCH_REQUIRE(differing_queries == 0);
+        }
+        CATCH_REQUIRE(std::abs(recall1 - recall2) <= 0.01);
+    };
+
+    CATCH_SECTION("Same-policy control: single-threaded") {
+        auto data1 = test_dataset::data_f32();
+        auto data2 = test_dataset::data_f32();
+        const size_t initial_size = data1.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto index1 =
+            SeqIndex(parameters, std::move(data1), indices, Distance(), size_t{1});
+        auto index2 =
+            SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{1});
+
+        check_graph_invariants(index1);
+        check_graph_invariants(index2);
+
+        auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        index1.search(results1.view(), queries.cview(), search_params);
+        index2.search(results2.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Same-policy control (SequentialSync, num_threads=1)", results1, results2, true
+        );
+    }
+
+    CATCH_SECTION("Same-policy control: multi-threaded") {
+        auto data1 = test_dataset::data_f32();
+        auto data2 = test_dataset::data_f32();
+        const size_t initial_size = data1.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto index1 =
+            SeqIndex(parameters, std::move(data1), indices, Distance(), size_t{2});
+        auto index2 =
+            SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{2});
+
+        check_graph_invariants(index1);
+        check_graph_invariants(index2);
+
+        auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        index1.search(results1.view(), queries.cview(), search_params);
+        index2.search(results2.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Same-policy control (SequentialSync, num_threads=2)", results1, results2, false
+        );
+    }
+
+    CATCH_SECTION("Cross-policy single-threaded") {
+        auto data_seq = test_dataset::data_f32();
+        auto data_seqlock = test_dataset::data_f32();
+        const size_t initial_size = data_seq.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto seq_index =
+            SeqIndex(parameters, std::move(data_seq), indices, Distance(), size_t{1});
+        auto seqlock_index = SeqlockIndex(
+            parameters, std::move(data_seqlock), indices, Distance(), size_t{1}
+        );
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
+
+        auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Cross-policy (SequentialSync vs SeqlockSync, num_threads=1)",
+            seq_results,
+            seqlock_results,
+            true
+        );
+    }
+
+    CATCH_SECTION("Cross-policy multi-threaded") {
+        // Multi-threaded builds are nondeterministic; only single-threaded arms
+        // establish policy equivalence.
+        auto data_seq = test_dataset::data_f32();
+        auto data_seqlock = test_dataset::data_f32();
+        const size_t initial_size = data_seq.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto seq_index =
+            SeqIndex(parameters, std::move(data_seq), indices, Distance(), size_t{2});
+        auto seqlock_index = SeqlockIndex(
+            parameters, std::move(data_seqlock), indices, Distance(), size_t{2}
+        );
+
+        CATCH_REQUIRE(seq_index.size() == initial_size);
+        CATCH_REQUIRE(seqlock_index.size() == initial_size);
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
+
+        auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: Initial build",
+            seq_results,
+            seqlock_results,
+            false
+        );
+
+        const size_t num_to_add = 5;
+        auto points_seq =
+            svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seq_index.dimensions());
+        auto points_seqlock = svs::data::SimpleData<float, svs::Dynamic>(
+            num_to_add, seqlock_index.dimensions()
+        );
+        for (size_t i = 0; i < num_to_add; ++i) {
+            std::vector<float> datum(seq_index.dimensions());
+            for (size_t j = 0; j < seq_index.dimensions(); ++j) {
+                datum[j] = static_cast<float>(i + j);
+            }
+            points_seq.set_datum(i, datum);
+            points_seqlock.set_datum(i, datum);
+        }
+        std::vector<size_t> new_ids(num_to_add);
+        std::iota(new_ids.begin(), new_ids.end(), initial_size);
+
+        seq_index.add_points(points_seq, new_ids);
+        seqlock_index.add_points(points_seqlock, new_ids);
+
+        CATCH_REQUIRE(seq_index.size() == initial_size + num_to_add);
+        CATCH_REQUIRE(seqlock_index.size() == initial_size + num_to_add);
+
+        for (const auto& id : new_ids) {
+            CATCH_REQUIRE(seq_index.has_id(id));
+            CATCH_REQUIRE(seqlock_index.has_id(id));
+        }
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: After add", seq_results, seqlock_results, false
+        );
+
+        std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
+        seq_index.delete_entries(ids_to_delete);
+        seqlock_index.delete_entries(ids_to_delete);
+
+        for (const auto& id : ids_to_delete) {
+            CATCH_REQUIRE(seq_index.is_deleted(id));
+            CATCH_REQUIRE(seqlock_index.is_deleted(id));
+        }
+
+        check_graph_invariants(seq_index);
+        check_graph_invariants(seqlock_index);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results, false
+        );
+
+        for (size_t q = 0; q < queries.size(); ++q) {
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                const auto seqlock_id = seqlock_results.index(q, i);
+                CATCH_REQUIRE(
+                    std::find(ids_to_delete.begin(), ids_to_delete.end(), seqlock_id) ==
+                    ids_to_delete.end()
+                );
+            }
+        }
+    }
 }
