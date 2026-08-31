@@ -147,7 +147,9 @@ class SimpleGraphBase {
 
         typename Access::state_type& state_;
         Idx node_;
-        uint8_t seq_;
+        // Store sequence value at full width to prevent truncation-induced wrap that
+        // allows read_validate to falsely accept a torn read.
+        svs::SeqLockCounter::counter_type seq_;
         [[no_unique_address]] std::conditional_t<
             std::same_as<Access, SeqlockAccess>,
             RelocatableSpinLock*,
@@ -226,11 +228,11 @@ class SimpleGraphBase {
     /// current sequence counter value if no write is in progress, or std::nullopt if a
     /// write is ongoing.
     ///
-    std::optional<uint8_t> read_begin(Idx i) const {
+    std::optional<svs::SeqLockCounter::counter_type> read_begin(Idx i) const {
         if constexpr (std::same_as<Access, SeqlockAccess>) {
             return access_state_.seq_counters[i].read_begin();
         } else {
-            return uint8_t{0};
+            return svs::SeqLockCounter::counter_type{0};
         }
     }
 
@@ -240,7 +242,7 @@ class SimpleGraphBase {
     /// Returns true if no concurrent write occurred during the read. For PlainAccess,
     /// always returns true.
     ///
-    bool read_validate(Idx i, uint8_t seq) const {
+    bool read_validate(Idx i, svs::SeqLockCounter::counter_type seq) const {
         if constexpr (std::same_as<Access, SeqlockAccess>) {
             return access_state_.seq_counters[i].read_validate(seq);
         } else {
