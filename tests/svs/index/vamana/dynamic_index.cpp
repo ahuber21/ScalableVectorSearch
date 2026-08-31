@@ -847,3 +847,232 @@ CATCH_TEST_CASE(
         }
     }
 }
+
+CATCH_TEST_CASE(
+    "SeqlockSync Load Path Parameterization", "[index][vamana][sync_policy][load]"
+) {
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+    using SeqGraph = svs::graphs::SimpleBlockedGraph<Idx>;
+    using SharedData = svs::data::SimpleData<float, svs::Dynamic>;
+
+    using SeqSync = svs::index::vamana::SequentialSync;
+    using SeqlockSync = svs::index::vamana::SeqlockSync;
+
+    const size_t num_threads = 2;
+    const size_t num_neighbors = 10;
+    auto queries = test_dataset::queries();
+    auto groundtruth = test_dataset::groundtruth_euclidean();
+    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
+    auto search_params = svs::index::vamana::VamanaSearchParameters{};
+    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
+
+    CATCH_SECTION("Compile-time check: auto_dynamic_assemble deduces SeqlockSync") {
+        // On-disk format is policy-agnostic; policy must be supplied by caller at load
+        // time.
+        auto data = test_dataset::data_f32();
+        const size_t initial_size = data.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        using BuildIndex =
+            svs::index::vamana::MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqSync>;
+        auto index =
+            BuildIndex(parameters, std::move(data), indices, Distance(), num_threads);
+
+        svs_test::prepare_temp_directory();
+        auto tmp = svs_test::temp_directory();
+        index.save(tmp / "config", tmp / "graph", tmp / "data");
+
+        // Graph storage format is independent of sync policy; load with the same graph
+        // type.
+        auto graph_loader = SVS_LAZY(SeqGraph::load(tmp / "graph"));
+        auto data_loader = SVS_LAZY(SharedData::load(tmp / "data"));
+        auto reloaded = svs::index::vamana::auto_dynamic_assemble<
+            decltype(graph_loader),
+            decltype(data_loader),
+            Distance,
+            size_t,
+            SeqlockSync>(
+            tmp / "config",
+            std::move(graph_loader),
+            std::move(data_loader),
+            Distance(),
+            num_threads
+        );
+
+        // Verify the loaded index instantiated with SeqlockSync.
+        using ReloadedType = decltype(reloaded);
+        using ExpectedType = svs::index::vamana::
+            MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqlockSync>;
+        static_assert(
+            std::is_same_v<ReloadedType, ExpectedType>,
+            "Reloaded index type must be MutableVamanaIndex<..., SeqlockSync>"
+        );
+    }
+
+    CATCH_SECTION("Behavioral round trip: save SequentialSync, load as SeqlockSync") {
+        auto data = test_dataset::data_f32();
+        const size_t initial_size = data.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        using BuildIndex =
+            svs::index::vamana::MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqSync>;
+        auto index =
+            BuildIndex(parameters, std::move(data), indices, Distance(), num_threads);
+
+        auto original_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        index.search(original_results.view(), queries.cview(), search_params);
+
+        svs_test::prepare_temp_directory();
+        auto tmp = svs_test::temp_directory();
+        index.save(tmp / "config", tmp / "graph", tmp / "data");
+
+        auto graph_loader = SVS_LAZY(SeqGraph::load(tmp / "graph"));
+        auto data_loader = SVS_LAZY(SharedData::load(tmp / "data"));
+        auto reloaded = svs::index::vamana::auto_dynamic_assemble<
+            decltype(graph_loader),
+            decltype(data_loader),
+            Distance,
+            size_t,
+            SeqlockSync>(
+            tmp / "config",
+            std::move(graph_loader),
+            std::move(data_loader),
+            Distance(),
+            num_threads
+        );
+
+        CATCH_REQUIRE(reloaded.size() == index.size());
+        CATCH_REQUIRE(reloaded.dimensions() == index.dimensions());
+
+        auto reloaded_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        reloaded.search(reloaded_results.view(), queries.cview(), search_params);
+
+        size_t differing = 0;
+        for (size_t q = 0; q < queries.size(); ++q) {
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                if (reloaded_results.index(q, i) != original_results.index(q, i)) {
+                    ++differing;
+                }
+            }
+        }
+        CATCH_INFO("Mismatches: " << differing);
+        CATCH_REQUIRE(differing == 0);
+    }
+
+    CATCH_SECTION("Same-policy round trip: build, save, and reload SeqlockSync") {
+        auto data = test_dataset::data_f32();
+        const size_t initial_size = data.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        using BuildIndex = svs::index::vamana::
+            MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqlockSync>;
+        auto index =
+            BuildIndex(parameters, std::move(data), indices, Distance(), num_threads);
+
+        auto original_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        index.search(original_results.view(), queries.cview(), search_params);
+
+        svs_test::prepare_temp_directory();
+        auto tmp = svs_test::temp_directory();
+        index.save(tmp / "config", tmp / "graph", tmp / "data");
+
+        auto graph_loader = SVS_LAZY(SeqGraph::load(tmp / "graph"));
+        auto data_loader = SVS_LAZY(SharedData::load(tmp / "data"));
+        auto reloaded = svs::index::vamana::auto_dynamic_assemble<
+            decltype(graph_loader),
+            decltype(data_loader),
+            Distance,
+            size_t,
+            SeqlockSync>(
+            tmp / "config",
+            std::move(graph_loader),
+            std::move(data_loader),
+            Distance(),
+            num_threads
+        );
+
+        CATCH_REQUIRE(reloaded.size() == index.size());
+        CATCH_REQUIRE(reloaded.dimensions() == index.dimensions());
+
+        auto reloaded_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        reloaded.search(reloaded_results.view(), queries.cview(), search_params);
+
+        size_t differing = 0;
+        for (size_t q = 0; q < queries.size(); ++q) {
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                if (reloaded_results.index(q, i) != original_results.index(q, i)) {
+                    ++differing;
+                }
+            }
+        }
+        CATCH_INFO("Mismatches: " << differing);
+        CATCH_REQUIRE(differing == 0);
+    }
+
+    CATCH_SECTION("Compile-time: all four entry points accept explicit SeqlockSync") {
+        // Entry point 1: auto_dynamic_assemble(path, ...) - exercised by runtime tests.
+
+        // Entry point 2: auto_dynamic_assemble(stream, lazy_graph, lazy_data, ...)
+        // Caller spelling: auto_dynamic_assemble<LazyGraph, LazyData, Distance,
+        // ThreadPool, SeqlockSync>
+        {
+            SeqGraph (*graph_fn)() = nullptr;
+            SharedData (*data_fn)() = nullptr;
+            using EP2_Result = decltype(svs::index::vamana::auto_dynamic_assemble<
+                                        decltype(graph_fn),
+                                        decltype(data_fn),
+                                        Distance,
+                                        size_t,
+                                        SeqlockSync>(
+                std::declval<std::istream&>(),
+                graph_fn,
+                data_fn,
+                std::declval<Distance>(),
+                std::declval<size_t>()
+            ));
+            using Expected = svs::index::vamana::
+                MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqlockSync>;
+            static_assert(std::is_same_v<EP2_Result, Expected>);
+        }
+
+        // Entry point 3: DynamicVamana::assemble<QueryType, GraphLoader, DataLoader,
+        // Distance, ThreadPool, Sync>(path, ...)
+        // Caller spelling: assemble<float, GraphLoader, DataLoader, Distance, ThreadPool,
+        // SeqlockSync>
+        {
+            using EP3_Result = decltype(svs::DynamicVamana::assemble<
+                                        float,
+                                        svs::GraphLoader<>,
+                                        svs::VectorDataLoader<float>,
+                                        Distance,
+                                        size_t,
+                                        SeqlockSync>(
+                std::declval<const std::filesystem::path&>(),
+                std::declval<svs::GraphLoader<>>(),
+                std::declval<svs::VectorDataLoader<float>>(),
+                std::declval<const Distance&>(),
+                std::declval<size_t>(),
+                false
+            ));
+            static_assert(std::is_same_v<EP3_Result, svs::DynamicVamana>);
+        }
+
+        // Entry point 4: DynamicVamana::assemble<QueryType, Data, Distance, ThreadPool,
+        // Sync>(stream, ...)
+        // Caller spelling: assemble<float, Data, Distance, ThreadPool, SeqlockSync>
+        {
+            using EP4_Result =
+                decltype(svs::DynamicVamana::
+                             assemble<float, SharedData, Distance, size_t, SeqlockSync>(
+                                 std::declval<std::istream&>(),
+                                 std::declval<const Distance&>(),
+                                 std::declval<size_t>()
+                             ));
+            static_assert(std::is_same_v<EP4_Result, svs::DynamicVamana>);
+        }
+    }
+}

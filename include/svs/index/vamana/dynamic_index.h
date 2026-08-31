@@ -1177,9 +1177,9 @@ class MutableVamanaIndex {
         );
 
         // After consolidation - set all `Deleted` slots to `Empty`.
-        for (auto& status : status_) {
-            if (status == SlotMetadata::Deleted) {
-                status = SlotMetadata::Empty;
+        for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
+            if (status_[i] == SlotMetadata::Deleted) {
+                status_[i] = SlotMetadata::Empty;
             }
         }
     }
@@ -1582,7 +1582,8 @@ template <
     typename GraphLoader,
     typename DataLoader,
     typename Distance,
-    typename ThreadPoolProto>
+    typename ThreadPoolProto,
+    SyncPolicy Sync = SequentialSync>
 auto auto_dynamic_assemble(
     const std::filesystem::path& config_path,
     GraphLoader&& graph_loader,
@@ -1654,8 +1655,9 @@ auto auto_dynamic_assemble(
     }
 
     // At this point, we should be completely validated.
-    // Construct the index!
-    return MutableVamanaIndex{
+    // Construct the index with the requested synchronization policy.
+    // The on-disk format is policy-agnostic; policy affects only the in-memory type.
+    return MutableVamanaIndex<decltype(graph), decltype(data), Distance, Sync>{
         parameters,
         std::move(data),
         std::move(graph),
@@ -1669,7 +1671,8 @@ template <
     typename LazyGraphLoader,
     typename LazyDataLoader,
     typename Distance,
-    typename ThreadPoolProto>
+    typename ThreadPoolProto,
+    SyncPolicy Sync = SequentialSync>
 auto auto_dynamic_assemble(
     std::istream& is,
     LazyGraphLoader graph_loader,
@@ -1711,7 +1714,7 @@ auto auto_dynamic_assemble(
     }
 
     auto threadpool = threads::as_threadpool(std::move(threadpool_proto));
-    return MutableVamanaIndex{
+    return MutableVamanaIndex<decltype(graph), decltype(data), Distance, Sync>{
         parameters,
         std::move(data),
         std::move(graph),
