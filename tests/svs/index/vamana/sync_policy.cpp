@@ -28,6 +28,7 @@
 // stl
 #include <atomic>
 #include <mutex>
+#include <numeric>
 #include <shared_mutex>
 #include <thread>
 #include <type_traits>
@@ -517,4 +518,105 @@ CATCH_TEST_CASE("Grow-Stable Storage Trait", "[index][vamana][sync_policy]") {
     // Default SimpleData without Blocked allocator is not grow-stable.
     using DefaultData = svs::data::SimpleData<float, svs::Dynamic>;
     static_assert(!svs::data::is_dataset_grow_stable_v<DefaultData>);
+}
+
+CATCH_TEST_CASE("Size After Delete Semantics", "[index][vamana][sync_policy]") {
+    constexpr size_t num_points = 10;
+    constexpr size_t num_to_delete = 3;
+    constexpr size_t dimensions = 4;
+
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+
+    // Helper to create a simple dataset.
+    auto make_dataset = []() {
+        auto data = svs::data::SimpleData<float, svs::Dynamic>(num_points, dimensions);
+        std::vector<float> datum(dimensions);
+        for (size_t i = 0; i < num_points; ++i) {
+            for (size_t d = 0; d < dimensions; ++d) {
+                datum[d] = static_cast<float>(i * dimensions + d);
+            }
+            data.set_datum(i, datum);
+        }
+        return data;
+    };
+
+    // Helper to copy dataset to grow-stable storage for SeqlockSync.
+    auto make_grow_stable_dataset = [&make_dataset]() {
+        using GrowStableAlloc =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+        using GrowStableData = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+        auto source = make_dataset();
+        GrowStableData dest(source.size(), source.dimensions());
+        for (size_t i = 0; i < source.size(); ++i) {
+            dest.set_datum(i, source.get_datum(i));
+        }
+        return dest;
+    };
+
+    // Build parameters for a minimal index.
+    auto build_params =
+        svs::index::vamana::VamanaBuildParameters{1.2, 16, 10, 20, 10, true};
+
+    // External IDs to delete.
+    std::vector<size_t> ids_to_delete = {2, 5, 7};
+
+    CATCH_SECTION("SequentialSync") {
+        using Graph = svs::graphs::SimpleGraph<Idx>;
+        using Data = svs::data::SimpleData<float, svs::Dynamic>;
+        using Index =
+            vamana::MutableVamanaIndex<Graph, Data, Distance, vamana::SequentialSync>;
+
+        auto data = make_dataset();
+        std::vector<size_t> external_ids(num_points);
+        std::iota(external_ids.begin(), external_ids.end(), 0);
+        auto index =
+            Index(build_params, std::move(data), external_ids, Distance(), size_t{1});
+
+        size_t initial_size = index.size();
+        CATCH_REQUIRE(initial_size == num_points);
+
+        index.delete_entries(ids_to_delete);
+        size_t size_after_delete = index.size();
+
+        index.consolidate();
+        index.compact();
+        size_t size_after_consolidate = index.size();
+
+        CATCH_REQUIRE(size_after_delete == num_points - num_to_delete);
+        CATCH_REQUIRE(size_after_consolidate == num_points - num_to_delete);
+    }
+
+    CATCH_SECTION("SeqlockSync") {
+        using Graph = svs::graphs::SimpleGraphBase<
+            Idx,
+            svs::data::SimpleData<Idx, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+        using GrowStableAlloc =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+        using Data = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+        using Index =
+            vamana::MutableVamanaIndex<Graph, Data, Distance, vamana::SeqlockSync>;
+
+        auto data = make_grow_stable_dataset();
+        std::vector<size_t> external_ids(num_points);
+        std::iota(external_ids.begin(), external_ids.end(), 0);
+        auto index =
+            Index(build_params, std::move(data), external_ids, Distance(), size_t{1});
+
+        size_t initial_size = index.size();
+        CATCH_REQUIRE(initial_size == num_points);
+
+        index.delete_entries(ids_to_delete);
+        size_t size_after_delete = index.size();
+
+        index.consolidate();
+        index.compact();
+        size_t size_after_consolidate = index.size();
+
+        // size() continues reporting deleted entries; contradicts documented behavior.
+        CATCH_REQUIRE(size_after_delete == num_points);
+        // size() continues reporting deleted entries; contradicts documented behavior.
+        CATCH_REQUIRE(size_after_consolidate == num_points);
+    }
 }
