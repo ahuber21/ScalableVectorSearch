@@ -444,3 +444,23 @@ CATCH_TEST_CASE("Slot Metadata Predicates", "[index][vamana][sync_policy]") {
         }
     }
 }
+
+CATCH_TEST_CASE("Grow-Stable Storage Trait", "[index][vamana][sync_policy]") {
+    // SegmentStable allocators provide address stability under growth.
+    using GrowStableAlloc =
+        svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+    using GrowStableData = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+    static_assert(svs::data::is_grow_stable_v<GrowStableAlloc>);
+    static_assert(svs::data::is_dataset_grow_stable_v<GrowStableData>);
+
+    // Reallocating allocators do not provide address stability.
+    using ReallocAlloc =
+        svs::data::Blocked<svs::lib::Allocator<float>, svs::data::Reallocating>;
+    using ReallocData = svs::data::SimpleData<float, svs::Dynamic, ReallocAlloc>;
+    static_assert(!svs::data::is_grow_stable_v<ReallocAlloc>);
+    static_assert(!svs::data::is_dataset_grow_stable_v<ReallocData>);
+
+    // Default SimpleData without Blocked allocator is not grow-stable.
+    using DefaultData = svs::data::SimpleData<float, svs::Dynamic>;
+    static_assert(!svs::data::is_dataset_grow_stable_v<DefaultData>);
+}

@@ -79,16 +79,25 @@ constexpr size_t kBuildThreads = 8;
 
 using Idx = uint32_t;
 using Distance = svs::distance::DistanceL2;
+// The graph's adjacency storage is already grow-stable via SeqlockAccess::state_type,
+// which uses lib::SegmentedVector. The graph data backing (node IDs) doesn't grow.
 using ConcurrentGraph = svs::graphs::SimpleGraphBase<
     Idx,
     svs::data::SimpleData<Idx, svs::Dynamic>,
     svs::graphs::SeqlockAccess>;
-using ConcurrentData = svs::data::SimpleData<float, svs::Dynamic>;
+// Concurrent searches hold dataset pointers without taking locks, so the dataset must
+// provide address-stable storage. A reallocating dataset causes use-after-free.
+using ConcurrentDataAlloc =
+    svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+using ConcurrentData = svs::data::SimpleData<float, svs::Dynamic, ConcurrentDataAlloc>;
 using ConcurrentIndex = svs::index::vamana::MutableVamanaIndex<
     ConcurrentGraph,
     ConcurrentData,
     Distance,
     svs::index::vamana::SeqlockSync>;
+
+static_assert(svs::data::is_grow_stable_v<ConcurrentDataAlloc>);
+static_assert(svs::data::is_dataset_grow_stable_v<ConcurrentData>);
 
 std::vector<float> random_vectors(size_t n, size_t dim, uint32_t seed) {
     std::mt19937 rng{seed};
@@ -114,7 +123,8 @@ std::unique_ptr<ConcurrentIndex> build_index(
     const std::vector<float>& raw, size_t dim, std::span<const size_t> ids, size_t threads
 ) {
     const size_t n = raw.size() / dim;
-    auto data = ConcurrentData(n, dim);
+    auto alloc = ConcurrentDataAlloc{};
+    auto data = ConcurrentData(n, dim, alloc);
     for (size_t i = 0; i < n; ++i) {
         data.set_datum(i, std::span<const float>(raw.data() + i * dim, dim));
     }
