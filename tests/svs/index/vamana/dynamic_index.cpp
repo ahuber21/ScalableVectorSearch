@@ -424,7 +424,7 @@ template <typename Graph, typename Data, typename Sync> void test_locking_impl()
     index.search(results.view(), queries.cview(), search_params);
 
     auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
-    CATCH_REQUIRE(recall > 0.0);
+    CATCH_REQUIRE(recall >= 0.25);
 
     auto query_span =
         std::span<const float>(queries.get_datum(0).data(), queries.dimensions());
@@ -552,7 +552,8 @@ CATCH_TEST_CASE(
 
     auto compare_results = [&](const char* description,
                                svs::QueryResult<size_t>& r1,
-                               svs::QueryResult<size_t>& r2) {
+                               svs::QueryResult<size_t>& r2,
+                               size_t max_differing_queries) {
         auto recall1 = svs::k_recall_at_n(groundtruth, r1, num_neighbors, num_neighbors);
         auto recall2 = svs::k_recall_at_n(groundtruth, r2, num_neighbors, num_neighbors);
 
@@ -579,8 +580,8 @@ CATCH_TEST_CASE(
                             << "Recall1: " << recall1 << ", Recall2: " << recall2
             );
         }
-        CATCH_REQUIRE(recall1 > 0.0);
-        CATCH_REQUIRE(recall2 > 0.0);
+        CATCH_REQUIRE(differing_queries <= max_differing_queries);
+        CATCH_REQUIRE(std::abs(recall1 - recall2) <= 0.01);
     };
 
     CATCH_SECTION("Same-policy control: two SequentialSync builds") {
@@ -602,7 +603,7 @@ CATCH_TEST_CASE(
         index2.search(results2.view(), queries.cview(), search_params);
 
         compare_results(
-            "Same-policy control (SequentialSync, num_threads=2)", results1, results2
+            "Same-policy control (SequentialSync, num_threads=2)", results1, results2, 700
         );
     }
 
@@ -628,7 +629,8 @@ CATCH_TEST_CASE(
         compare_results(
             "Cross-policy (SequentialSync vs SeqlockSync, num_threads=1)",
             seq_results,
-            seqlock_results
+            seqlock_results,
+            0
         );
     }
 
@@ -654,7 +656,7 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: Initial build", seq_results, seqlock_results
+            "Cross-policy multi-threaded: Initial build", seq_results, seqlock_results, 700
         );
 
         const size_t num_to_add = 5;
@@ -688,7 +690,7 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: After add", seq_results, seqlock_results
+            "Cross-policy multi-threaded: After add", seq_results, seqlock_results, 700
         );
 
         std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
@@ -703,7 +705,7 @@ CATCH_TEST_CASE(
         seq_index.search(seq_results.view(), queries.cview(), search_params);
         seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
         compare_results(
-            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results
+            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results, 700
         );
 
         for (size_t q = 0; q < queries.size(); ++q) {
