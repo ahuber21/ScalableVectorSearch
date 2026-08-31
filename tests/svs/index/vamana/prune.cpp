@@ -24,6 +24,8 @@
 // catch2
 #include "catch2/catch_test_macros.hpp"
 
+#include <algorithm>
+#include <random>
 #include <vector>
 
 namespace {
@@ -72,30 +74,31 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
         }
 
         CATCH_SECTION("Basic Functionality") {
-            constexpr size_t num_points = 5;
+            // Dataset that forces phase 2 to run by producing Candidate nodes.
+            // With alpha=1.2, id2 and id3 fall in the band where cmp(djk, dist)
+            // but not cmp(alpha*djk, dist), becoming Candidates rather than Pruned.
+            constexpr size_t num_points = 4;
             constexpr size_t dims = 2;
             auto dataset = svs::data::SimpleData<float>(num_points, dims);
             dataset.get_datum(0)[0] = 0.0f;
             dataset.get_datum(0)[1] = 0.0f;
             dataset.get_datum(1)[0] = 1.0f;
             dataset.get_datum(1)[1] = 0.0f;
-            dataset.get_datum(2)[0] = 0.0f;
+            dataset.get_datum(2)[0] = 0.6f;
             dataset.get_datum(2)[1] = 1.0f;
-            dataset.get_datum(3)[0] = 2.0f;
-            dataset.get_datum(3)[1] = 0.0f;
-            dataset.get_datum(4)[0] = 3.0f;
-            dataset.get_datum(4)[1] = 0.0f;
+            dataset.get_datum(3)[0] = 0.7f;
+            dataset.get_datum(3)[1] = 1.5f;
 
             auto accessor = SimpleAccessor();
             auto distance = svs::distance::DistanceL2();
 
+            // Pool sorted by squared distance from p0: 1.00, 1.36, 2.74.
             std::vector<svs::Neighbor<size_t>> pool = {
-                svs::Neighbor<size_t>(1, 1.0f),
-                svs::Neighbor<size_t>(2, 1.0f),
-                svs::Neighbor<size_t>(3, 4.0f),
-                svs::Neighbor<size_t>(4, 9.0f)};
+                svs::Neighbor<size_t>(1, 1.00f),
+                svs::Neighbor<size_t>(2, 1.36f),
+                svs::Neighbor<size_t>(3, 2.74f)};
 
-            std::vector<size_t> result;
+            std::vector<size_t> result_alpha_1_2;
             v::heuristic_prune_neighbors(
                 v::TwoPhasePruneStrategy(),
                 3,
@@ -105,16 +108,122 @@ CATCH_TEST_CASE("Pruning", "[index][vamana]") {
                 distance,
                 0,
                 std::span<const svs::Neighbor<size_t>>(pool),
-                result
+                result_alpha_1_2
             );
 
-            CATCH_REQUIRE(result.size() <= 3);
-            CATCH_REQUIRE(result.size() > 0);
-            for (size_t i = 0; i < result.size(); ++i) {
-                for (size_t j = i + 1; j < result.size(); ++j) {
-                    CATCH_REQUIRE(result[i] != result[j]);
+            // Phase 1 adds id1, marks id2 and id3 as Candidate.
+            // Phase 2 adds id2, prunes id3. Expected: exactly {1, 2}.
+            CATCH_REQUIRE(result_alpha_1_2.size() == 2);
+            CATCH_REQUIRE(result_alpha_1_2[0] == 1);
+            CATCH_REQUIRE(result_alpha_1_2[1] == 2);
+
+            // Contrasting case: alpha=1.0 collapses the band, so id2 and id3
+            // are Pruned in phase 1, phase 2 has no Candidates. Expected: {1}.
+            std::vector<size_t> result_alpha_1_0;
+            v::heuristic_prune_neighbors(
+                v::TwoPhasePruneStrategy(),
+                3,
+                1.0f,
+                dataset,
+                accessor,
+                distance,
+                0,
+                std::span<const svs::Neighbor<size_t>>(pool),
+                result_alpha_1_0
+            );
+
+            CATCH_REQUIRE(result_alpha_1_0.size() == 1);
+            CATCH_REQUIRE(result_alpha_1_0[0] == 1);
+
+            // Results differ, proving phase 2 executed for alpha=1.2.
+            CATCH_REQUIRE(result_alpha_1_2 != result_alpha_1_0);
+        }
+
+        CATCH_SECTION("Differential Test: TwoPhase vs Iterative") {
+            // Generate deterministic random pools and verify both strategies
+            // produce valid results, then confirm they sometimes diverge.
+            constexpr size_t num_points = 20;
+            constexpr size_t dims = 4;
+            auto dataset = svs::data::SimpleData<float>(num_points, dims);
+
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist(0.0f, 10.0f);
+            for (size_t i = 0; i < num_points; ++i) {
+                for (size_t j = 0; j < dims; ++j) {
+                    dataset.get_datum(i)[j] = dist(rng);
                 }
             }
+
+            auto accessor = SimpleAccessor();
+            auto distance = svs::distance::DistanceL2();
+            constexpr size_t max_result_size = 5;
+            constexpr float alpha = 1.3f;
+            constexpr size_t num_trials = 50;
+
+            size_t divergence_count = 0;
+            for (size_t trial = 0; trial < num_trials; ++trial) {
+                // Build a random pool of 10 neighbors for node 0.
+                std::vector<svs::Neighbor<size_t>> pool;
+                for (size_t i = 1; i < std::min(num_points, size_t(11)); ++i) {
+                    float d = svs::distance::compute(
+                        distance, accessor(dataset, 0), accessor(dataset, i)
+                    );
+                    pool.emplace_back(i, d);
+                }
+                std::sort(pool.begin(), pool.end(), svs::distance::comparator(distance));
+
+                std::vector<size_t> result_two_phase;
+                v::heuristic_prune_neighbors(
+                    v::TwoPhasePruneStrategy(),
+                    max_result_size,
+                    alpha,
+                    dataset,
+                    accessor,
+                    distance,
+                    0,
+                    std::span<const svs::Neighbor<size_t>>(pool),
+                    result_two_phase
+                );
+
+                std::vector<size_t> result_iterative;
+                v::heuristic_prune_neighbors(
+                    v::IterativePruneStrategy(),
+                    max_result_size,
+                    alpha,
+                    dataset,
+                    accessor,
+                    distance,
+                    0,
+                    std::span<const svs::Neighbor<size_t>>(pool),
+                    result_iterative
+                );
+
+                // Validity checks for both strategies.
+                for (const auto& result : {result_two_phase, result_iterative}) {
+                    CATCH_REQUIRE(result.size() <= max_result_size);
+                    for (size_t i = 0; i < result.size(); ++i) {
+                        CATCH_REQUIRE(result[i] != 0);
+                        for (size_t j = i + 1; j < result.size(); ++j) {
+                            CATCH_REQUIRE(result[i] != result[j]);
+                        }
+                        bool found = false;
+                        for (const auto& n : pool) {
+                            if (n.id() == result[i]) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        CATCH_REQUIRE(found);
+                    }
+                }
+
+                if (result_two_phase != result_iterative) {
+                    ++divergence_count;
+                }
+            }
+
+            // If the strategies diverged at least once, the tag is meaningful.
+            CATCH_REQUIRE(divergence_count > 0);
         }
     }
 }
