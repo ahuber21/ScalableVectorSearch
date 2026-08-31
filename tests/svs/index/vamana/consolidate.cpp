@@ -105,11 +105,13 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
 
         auto predicate = [](const auto& i) { return (i % 10) == 0; };
         svs::distance::DistanceL2 distance{};
+        // Single-threaded for deterministic total edge count comparison.
+        auto single_thread = svs::threads::DefaultThreadPool(1);
 
         svs::index::vamana::consolidate(
             plain_graph,
             data,
-            threadpool,
+            single_thread,
             plain_graph.max_degree(),
             750,
             1.2,
@@ -119,7 +121,7 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
         svs::index::vamana::consolidate(
             seqlock_graph,
             data,
-            threadpool,
+            single_thread,
             seqlock_graph.max_degree(),
             750,
             1.2,

@@ -199,9 +199,9 @@ class GraphConsolidator {
         for (auto dst : neighbors) {
             if (is_deleted(dst)) {
                 const auto& others = graph_.get_node(dst);
-                // AtomicSpan iterator is input_iterator_tag; copy to vector for insertion.
-                std::vector<I> neighbors_vec(others.begin(), others.end());
-                all_candidates.insert(neighbors_vec.begin(), neighbors_vec.end());
+                for (auto n : others) {
+                    all_candidates.insert(n);
+                }
             } else {
                 all_candidates.insert(dst);
             }
