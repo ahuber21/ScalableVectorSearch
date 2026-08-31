@@ -247,3 +247,42 @@ list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(CTest)
 include(Catch)
 catch_discover_tests(tests ADD_TAGS_AS_LABELS SKIP_IS_FAILURE)
+
+#####
+##### ThreadSanitizer Tests
+#####
+
+option(SVS_BUILD_TSAN_TESTS
+    "Build ThreadSanitizer concurrency tests (positive and negative controls)."
+    OFF
+)
+
+if (SVS_BUILD_TSAN_TESTS)
+    # Positive control: concurrent index with SeqlockSync should be race-free.
+    add_executable(concurrent_tsan
+        ${TEST_DIR}/svs/concurrent/concurrency.cpp
+    )
+    target_compile_options(concurrent_tsan PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(concurrent_tsan PRIVATE -fsanitize=thread)
+    target_compile_definitions(concurrent_tsan PRIVATE SVS_THREAD_SANITIZER)
+    target_compile_definitions(concurrent_tsan PRIVATE SVS_TEST_DATA_DIR="${DATA_DIRECTORY}")
+    target_link_libraries(concurrent_tsan PRIVATE svs::svs Catch2::Catch2WithMain)
+    target_link_libraries(concurrent_tsan PRIVATE svs_compile_options svs_x86_options_base)
+    target_include_directories(concurrent_tsan PRIVATE ${PROJECT_SOURCE_DIR})
+    add_test(NAME concurrent_tsan COMMAND concurrent_tsan)
+    set_tests_properties(concurrent_tsan PROPERTIES LABELS "tsan")
+
+    # Negative control: unsafe SequentialSync policy must exhibit data races.
+    add_executable(concurrent_tsan_negative
+        ${TEST_DIR}/svs/concurrent/concurrency_unsafe.cpp
+    )
+    target_compile_options(concurrent_tsan_negative PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(concurrent_tsan_negative PRIVATE -fsanitize=thread)
+    target_compile_definitions(concurrent_tsan_negative PRIVATE SVS_THREAD_SANITIZER)
+    target_compile_definitions(concurrent_tsan_negative PRIVATE SVS_TEST_DATA_DIR="${DATA_DIRECTORY}")
+    target_link_libraries(concurrent_tsan_negative PRIVATE svs::svs Catch2::Catch2WithMain)
+    target_link_libraries(concurrent_tsan_negative PRIVATE svs_compile_options svs_x86_options_base)
+    target_include_directories(concurrent_tsan_negative PRIVATE ${PROJECT_SOURCE_DIR})
+    add_test(NAME concurrent_tsan_negative COMMAND concurrent_tsan_negative)
+    set_tests_properties(concurrent_tsan_negative PROPERTIES WILL_FAIL TRUE LABELS "tsan")
+endif()
