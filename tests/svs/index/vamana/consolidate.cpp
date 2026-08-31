@@ -42,6 +42,16 @@ template <typename Graph, typename Predicate>
 void check_post_conditions(const Graph& graph, Predicate&& predicate) {
     bool contains_deleted = false;
     svs::threads::UnitRange<size_t> node_range{0, graph.n_nodes()};
+
+    size_t nodes_with_deleted_neighbors = 0;
+    size_t first_deleted_neighbor = SIZE_MAX;
+    size_t nodes_with_out_of_range_ids = 0;
+    size_t first_out_of_range = SIZE_MAX;
+    size_t nodes_exceeding_max_degree = 0;
+    size_t first_exceeding_max_degree = SIZE_MAX;
+    size_t nodes_with_duplicate_edges = 0;
+    size_t first_duplicate_edge = SIZE_MAX;
+
     for (size_t i : node_range) {
         if (predicate(i)) {
             contains_deleted = true;
@@ -49,17 +59,51 @@ void check_post_conditions(const Graph& graph, Predicate&& predicate) {
         }
 
         const auto& neighbors = graph.get_node(i);
-        CATCH_REQUIRE(std::none_of(neighbors.begin(), neighbors.end(), predicate));
 
-        CATCH_REQUIRE(std::all_of(neighbors.begin(), neighbors.end(), [&](const auto& i) {
-            return node_range.contains(i);
-        }));
+        if (!std::none_of(neighbors.begin(), neighbors.end(), predicate)) {
+            ++nodes_with_deleted_neighbors;
+            if (first_deleted_neighbor == SIZE_MAX) {
+                first_deleted_neighbor = i;
+            }
+        }
 
-        CATCH_REQUIRE(neighbors.size() <= graph.max_degree());
+        if (!std::all_of(neighbors.begin(), neighbors.end(), [&](const auto& j) {
+                return node_range.contains(j);
+            })) {
+            ++nodes_with_out_of_range_ids;
+            if (first_out_of_range == SIZE_MAX) {
+                first_out_of_range = i;
+            }
+        }
+
+        if (neighbors.size() > graph.max_degree()) {
+            ++nodes_exceeding_max_degree;
+            if (first_exceeding_max_degree == SIZE_MAX) {
+                first_exceeding_max_degree = i;
+            }
+        }
 
         std::unordered_set<uint32_t> unique_neighbors(neighbors.begin(), neighbors.end());
-        CATCH_REQUIRE(unique_neighbors.size() == neighbors.size());
+        if (unique_neighbors.size() != neighbors.size()) {
+            ++nodes_with_duplicate_edges;
+            if (first_duplicate_edge == SIZE_MAX) {
+                first_duplicate_edge = i;
+            }
+        }
     }
+
+    CATCH_INFO("First node with deleted neighbor: " << first_deleted_neighbor);
+    CATCH_REQUIRE(nodes_with_deleted_neighbors == 0);
+
+    CATCH_INFO("First node with out-of-range id: " << first_out_of_range);
+    CATCH_REQUIRE(nodes_with_out_of_range_ids == 0);
+
+    CATCH_INFO("First node exceeding max_degree: " << first_exceeding_max_degree);
+    CATCH_REQUIRE(nodes_exceeding_max_degree == 0);
+
+    CATCH_INFO("First node with duplicate edges: " << first_duplicate_edge);
+    CATCH_REQUIRE(nodes_with_duplicate_edges == 0);
+
     CATCH_REQUIRE(contains_deleted);
 }
 
