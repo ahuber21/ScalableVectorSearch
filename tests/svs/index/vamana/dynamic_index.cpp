@@ -1012,4 +1012,67 @@ CATCH_TEST_CASE(
         CATCH_INFO("Mismatches: " << differing);
         CATCH_REQUIRE(differing == 0);
     }
+
+    CATCH_SECTION("Compile-time: all four entry points accept explicit SeqlockSync") {
+        // Entry point 1: auto_dynamic_assemble(path, ...) - exercised by runtime tests.
+
+        // Entry point 2: auto_dynamic_assemble(stream, lazy_graph, lazy_data, ...)
+        // Caller spelling: auto_dynamic_assemble<LazyGraph, LazyData, Distance,
+        // ThreadPool, SeqlockSync>
+        {
+            SeqGraph (*graph_fn)() = nullptr;
+            SharedData (*data_fn)() = nullptr;
+            using EP2_Result = decltype(svs::index::vamana::auto_dynamic_assemble<
+                                        decltype(graph_fn),
+                                        decltype(data_fn),
+                                        Distance,
+                                        size_t,
+                                        SeqlockSync>(
+                std::declval<std::istream&>(),
+                graph_fn,
+                data_fn,
+                std::declval<Distance>(),
+                std::declval<size_t>()
+            ));
+            using Expected = svs::index::vamana::
+                MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqlockSync>;
+            static_assert(std::is_same_v<EP2_Result, Expected>);
+        }
+
+        // Entry point 3: DynamicVamana::assemble<QueryType, GraphLoader, DataLoader,
+        // Distance, ThreadPool, Sync>(path, ...)
+        // Caller spelling: assemble<float, GraphLoader, DataLoader, Distance, ThreadPool,
+        // SeqlockSync>
+        {
+            using EP3_Result = decltype(svs::DynamicVamana::assemble<
+                                        float,
+                                        svs::GraphLoader<>,
+                                        svs::VectorDataLoader<float>,
+                                        Distance,
+                                        size_t,
+                                        SeqlockSync>(
+                std::declval<const std::filesystem::path&>(),
+                std::declval<svs::GraphLoader<>>(),
+                std::declval<svs::VectorDataLoader<float>>(),
+                std::declval<const Distance&>(),
+                std::declval<size_t>(),
+                false
+            ));
+            static_assert(std::is_same_v<EP3_Result, svs::DynamicVamana>);
+        }
+
+        // Entry point 4: DynamicVamana::assemble<QueryType, Data, Distance, ThreadPool,
+        // Sync>(stream, ...)
+        // Caller spelling: assemble<float, Data, Distance, ThreadPool, SeqlockSync>
+        {
+            using EP4_Result =
+                decltype(svs::DynamicVamana::
+                             assemble<float, SharedData, Distance, size_t, SeqlockSync>(
+                                 std::declval<std::istream&>(),
+                                 std::declval<const Distance&>(),
+                                 std::declval<size_t>()
+                             ));
+            static_assert(std::is_same_v<EP4_Result, svs::DynamicVamana>);
+        }
+    }
 }
