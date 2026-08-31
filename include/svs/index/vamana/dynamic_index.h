@@ -37,6 +37,7 @@
 #include "svs/index/vamana/dynamic_search_buffer.h"
 #include "svs/index/vamana/greedy_search.h"
 #include "svs/index/vamana/index.h"
+#include "svs/index/vamana/sync_policy.h"
 #include "svs/index/vamana/vamana_build.h"
 #include "svs/lib/boundscheck.h"
 #include "svs/lib/preprocessor.h"
@@ -61,10 +62,16 @@ class MultiMutableVamanaIndex;
 /// * Deleted: Exists in the associated dataset, but should be considered as "deleted"
 /// and not returned from any search algorithms.
 /// * Empty: Non-existent and unreachable from standard entry points.
+/// * Pending: Reserved for insertion but not yet visible to search.
 ///
 /// Only used for `MutableVamanaIndex`.
 ///
-enum class SlotMetadata : uint8_t { Empty = 0x00, Valid = 0x01, Deleted = 0x02 };
+enum class SlotMetadata : uint8_t {
+    Empty = 0x00,
+    Valid = 0x01,
+    Deleted = 0x02,
+    Pending = 0x04
+};
 
 template <SlotMetadata Metadata> inline constexpr std::string_view name();
 template <> inline constexpr std::string_view name<SlotMetadata::Empty>() {
@@ -76,6 +83,9 @@ template <> inline constexpr std::string_view name<SlotMetadata::Valid>() {
 template <> inline constexpr std::string_view name<SlotMetadata::Deleted>() {
     return "Deleted";
 }
+template <> inline constexpr std::string_view name<SlotMetadata::Pending>() {
+    return "Pending";
+}
 
 // clang-format off
 inline constexpr std::string_view name(SlotMetadata metadata) {
@@ -84,30 +94,41 @@ inline constexpr std::string_view name(SlotMetadata metadata) {
         SVS_SWITCH_RETURN(SlotMetadata::Empty)
         SVS_SWITCH_RETURN(SlotMetadata::Valid)
         SVS_SWITCH_RETURN(SlotMetadata::Deleted)
+        SVS_SWITCH_RETURN(SlotMetadata::Pending)
     }
     #undef SVS_SWITCH_RETURN
     throw ANNEXCEPTION("Unreachable!");
 }
 // clang-format on
 
-class ValidBuilder {
+template <typename Container, bool ReservesPending> class ValidBuilder {
   public:
-    ValidBuilder(const std::vector<SlotMetadata>& status)
+    ValidBuilder(const Container& status)
         : status_{status} {}
 
     template <typename I>
     constexpr PredicatedSearchNeighbor<I> operator()(I i, float distance) const {
-        bool invalid = getindex(status_, i) == SlotMetadata::Deleted;
-        // This neighbor should be skipped if the metadata corresponding to the given index
-        // marks this slot as deleted.
+        bool invalid;
+        if constexpr (ReservesPending) {
+            // Concurrent: Pending slots must be hidden until promoted to Valid.
+            invalid = getindex(status_, i) != SlotMetadata::Valid;
+        } else {
+            // Sequential: Empty counts as valid; only Deleted is invalid.
+            invalid = getindex(status_, i) == SlotMetadata::Deleted;
+        }
         return PredicatedSearchNeighbor<I>(i, distance, !invalid);
     }
 
   private:
-    const std::vector<SlotMetadata>& status_;
+    const Container& status_;
 };
 
-template <graphs::MemoryGraph Graph, typename Data, typename Dist>
+template <
+    graphs::MemoryGraph Graph,
+    typename Data,
+    typename Dist,
+    typename Sync = SequentialSync>
+    requires SyncPolicyFor<Sync, Graph>
 class MutableVamanaIndex {
     template <graphs::MemoryGraph, typename, typename, typename>
     friend class MultiMutableVamanaIndex;
@@ -151,9 +172,10 @@ class MutableVamanaIndex {
     graph_type graph_;
     data_type data_;
     entry_point_type entry_point_;
-    std::vector<SlotMetadata> status_;
-    size_t first_empty_ = 0;
+    typename Sync::template container_type<SlotMetadata> status_;
+    typename Sync::counter_type first_empty_;
     IDTranslator translator_;
+    [[no_unique_address]] typename Sync::mutex_type slot_alloc_mutex_;
 
     // Thread local data structures.
     distance_type distance_;
@@ -193,6 +215,7 @@ class MutableVamanaIndex {
         , status_(data_.size(), SlotMetadata::Valid)
         , first_empty_{data_.size()}
         , translator_()
+        , slot_alloc_mutex_{}
         , distance_{std::move(distance_function)}
         , threadpool_{threads::as_threadpool(std::move(threadpool_proto))}
         , search_parameters_{vamana::construct_default_search_parameters(data_)}
@@ -220,6 +243,7 @@ class MutableVamanaIndex {
         , status_(data_.size(), SlotMetadata::Valid)
         , first_empty_{data_.size()}
         , translator_()
+        , slot_alloc_mutex_{}
         , distance_(std::move(distance_function))
         , threadpool_(threads::as_threadpool(std::move(threadpool_proto)))
         , search_parameters_(vamana::construct_default_search_parameters(data_))
@@ -286,6 +310,7 @@ class MutableVamanaIndex {
         , status_{data_.size(), SlotMetadata::Valid}
         , first_empty_{data_.size()}
         , translator_{std::move(translator)}
+        , slot_alloc_mutex_{}
         , distance_{distance_function}
         , threadpool_{std::move(threadpool)}
         , search_parameters_{config.search_parameters}
@@ -478,7 +503,11 @@ class MutableVamanaIndex {
 
     // Return a `greedy_search` compatible builder for this index.
     // This is an internal method, mostly used to help implement the batch iterator.
-    ValidBuilder internal_search_builder() const { return ValidBuilder{status_}; }
+    auto internal_search_builder() const {
+        return ValidBuilder<
+            typename Sync::template container_type<SlotMetadata>,
+            Sync::reserves_pending_slots>{status_};
+    }
 
     auto greedy_search_closure(
         GreedySearchPrefetchParameters prefetch_parameters,
@@ -673,37 +702,50 @@ class MutableVamanaIndex {
         slots.reserve(num_points);
         bool have_room = false;
 
-        size_t s = reuse_empty ? 0 : first_empty_;
-        size_t smax = status_.size();
-        for (; s < smax; ++s) {
-            if (status_[s] == SlotMetadata::Empty) {
-                slots.push_back(s);
+        {
+            std::lock_guard lock{slot_alloc_mutex_};
+            size_t s = reuse_empty ? 0 : first_empty_.load();
+            size_t smax = status_.size();
+            for (; s < smax; ++s) {
+                if (status_[s] == SlotMetadata::Empty) {
+                    slots.push_back(s);
+                    if constexpr (Sync::reserves_pending_slots) {
+                        status_[s] = SlotMetadata::Pending;
+                    }
+                }
+                if (slots.size() == num_points) {
+                    have_room = true;
+                    break;
+                }
             }
-            if (slots.size() == num_points) {
-                have_room = true;
-                break;
+
+            // Check if we have enough indices. If we don't, we need to resize the data and
+            // the graph.
+            if (!have_room) {
+                size_t needed = num_points - slots.size();
+                size_t current_size = data_.size();
+                size_t new_size = current_size + needed;
+                data_.resize(new_size);
+
+                // Graph resizing marked as un-safe because graph contain internal
+                // references and thus it's not a good idea to go around shrinking the graph
+                // without care.
+                //
+                // However, we are only growing here, so resizing will not change any
+                // invariants.
+                graph_.unsafe_resize(new_size);
+                status_.resize(new_size, SlotMetadata::Empty);
+
+                // Append the correct number of extra slots.
+                threads::UnitRange<size_t> extra_points{
+                    current_size, current_size + needed};
+                for (auto slot : extra_points) {
+                    slots.push_back(slot);
+                    if constexpr (Sync::reserves_pending_slots) {
+                        status_[slot] = SlotMetadata::Pending;
+                    }
+                }
             }
-        }
-
-        // Check if we have enough indices. If we don't, we need to resize the data and
-        // the graph.
-        if (!have_room) {
-            size_t needed = num_points - slots.size();
-            size_t current_size = data_.size();
-            size_t new_size = current_size + needed;
-            data_.resize(new_size);
-
-            // Graph resizing marked as un-safe because graph contain internal references
-            // and thus it's not a good idea to go around shrinking the graph without care.
-            //
-            // However, we are only growing here, so resizing will not change any
-            // invariants.
-            graph_.unsafe_resize(new_size);
-            status_.resize(new_size, SlotMetadata::Empty);
-
-            // Append the correct number of extra slots.
-            threads::UnitRange<size_t> extra_points{current_size, current_size + needed};
-            slots.insert(slots.end(), extra_points.begin(), extra_points.end());
         }
         assert(slots.size() == num_points);
 
@@ -738,13 +780,16 @@ class MutableVamanaIndex {
             logger_,
             logging::Level::Trace};
         builder.construct(alpha_, entry_point(), slots, logging::Level::Trace, logger_);
+
         // Mark all added entries as valid.
+        // When reserves_pending_slots=true this promotes from Pending; otherwise from
+        // Empty.
         for (const auto& i : slots) {
             status_[i] = SlotMetadata::Valid;
         }
 
         if (!slots.empty()) {
-            first_empty_ = std::max(first_empty_, slots.back() + 1);
+            first_empty_.fetch_max(slots.back() + 1);
         }
         return slots;
     }
@@ -776,7 +821,9 @@ class MutableVamanaIndex {
         for (auto i : ids) {
             delete_entry(translator_.get_internal(i));
         }
-        translator_.delete_external(ids);
+        if constexpr (!Sync::defers_translator_cleanup) {
+            translator_.delete_external(ids);
+        }
         return ids.size();
     }
 
@@ -892,7 +939,7 @@ class MutableVamanaIndex {
         // Resize the graph and data.
         graph_.unsafe_resize(max_index);
         data_.resize(max_index);
-        first_empty_ = max_index;
+        first_empty_.store(max_index);
 
         // Compact metadata and ID remapping.
         for (size_t new_id = 0; new_id < max_index; ++new_id) {
@@ -1263,7 +1310,8 @@ class MutableVamanaIndex {
                 case SlotMetadata::Deleted: {
                     return allow_deleted;
                 }
-                case SlotMetadata::Empty: {
+                case SlotMetadata::Empty:
+                case SlotMetadata::Pending: {
                     return false;
                 }
             }

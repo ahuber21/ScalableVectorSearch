@@ -41,6 +41,22 @@
 #include "tests/utils/test_dataset.h"
 #include "tests/utils/utils.h"
 
+// Verify that adding the Sync parameter is behaviour-preserving for the sequential path.
+namespace {
+using TestGraph = svs::graphs::SimpleBlockedGraph<uint32_t>;
+using TestData = svs::data::SimpleData<float, svs::Dynamic>;
+using TestDist = svs::distance::DistanceL2;
+
+// The three-argument spelling should still work and should default to SequentialSync.
+using ThreeArgIndex = svs::index::vamana::MutableVamanaIndex<TestGraph, TestData, TestDist>;
+using ExplicitSeqIndex = svs::index::vamana::
+    MutableVamanaIndex<TestGraph, TestData, TestDist, svs::index::vamana::SequentialSync>;
+static_assert(std::is_same_v<ThreeArgIndex, ExplicitSeqIndex>);
+
+// The mutex must be zero-sized for SequentialSync.
+static_assert(std::is_empty_v<svs::index::vamana::SequentialSync::mutex_type>);
+} // namespace
+
 // The MutableVamanaIndex "Soft Deletion" test uses outdated API.
 #if 0
 namespace {
