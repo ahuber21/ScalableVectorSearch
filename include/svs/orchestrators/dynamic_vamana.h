@@ -360,8 +360,8 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
         typename Data,
         typename Distance,
         typename ThreadPoolProto,
-        typename... DataLoaderArgs,
-        index::vamana::SyncPolicy Sync = index::vamana::SequentialSync>
+        index::vamana::SyncPolicy Sync = index::vamana::SequentialSync,
+        typename... DataLoaderArgs>
     static DynamicVamana assemble(
         std::istream& stream,
         const Distance& distance,
@@ -386,7 +386,7 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
                             decltype(graph_loader),
                             decltype(data_loader),
                             decltype(distance_function),
-                            decltype(std::move(threadpool)),
+                            decltype(threadpool),
                             Sync>(
                             stream,
                             graph_loader,
@@ -406,7 +406,7 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
                         decltype(graph_loader),
                         decltype(data_loader),
                         Distance,
-                        decltype(std::move(threadpool)),
+                        decltype(threadpool),
                         Sync>(
                         stream, graph_loader, data_loader, distance, std::move(threadpool)
                     )
@@ -434,7 +434,6 @@ class DynamicVamana : public manager::IndexManager<DynamicVamanaInterface> {
                 throw ANNEXCEPTION("Invalid Vamana index archive: missing data directory!");
             }
 
-            // Forward Sync to the recursive call; other types deduce from arguments.
             auto graph = svs::GraphLoader{graph_path};
             auto data = lib::load_from_disk<Data>(data_path, SVS_FWD(data_args)...);
             auto pool = threads::as_threadpool(std::move(threadpool_proto));

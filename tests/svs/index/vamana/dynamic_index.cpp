@@ -961,4 +961,55 @@ CATCH_TEST_CASE(
         CATCH_INFO("Mismatches: " << differing);
         CATCH_REQUIRE(differing == 0);
     }
+
+    CATCH_SECTION("Same-policy round trip: build, save, and reload SeqlockSync") {
+        auto data = test_dataset::data_f32();
+        const size_t initial_size = data.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        using BuildIndex = svs::index::vamana::
+            MutableVamanaIndex<SeqGraph, SharedData, Distance, SeqlockSync>;
+        auto index =
+            BuildIndex(parameters, std::move(data), indices, Distance(), num_threads);
+
+        auto original_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        index.search(original_results.view(), queries.cview(), search_params);
+
+        svs_test::prepare_temp_directory();
+        auto tmp = svs_test::temp_directory();
+        index.save(tmp / "config", tmp / "graph", tmp / "data");
+
+        auto graph_loader = SVS_LAZY(SeqGraph::load(tmp / "graph"));
+        auto data_loader = SVS_LAZY(SharedData::load(tmp / "data"));
+        auto reloaded = svs::index::vamana::auto_dynamic_assemble<
+            decltype(graph_loader),
+            decltype(data_loader),
+            Distance,
+            size_t,
+            SeqlockSync>(
+            tmp / "config",
+            std::move(graph_loader),
+            std::move(data_loader),
+            Distance(),
+            num_threads
+        );
+
+        CATCH_REQUIRE(reloaded.size() == index.size());
+        CATCH_REQUIRE(reloaded.dimensions() == index.dimensions());
+
+        auto reloaded_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        reloaded.search(reloaded_results.view(), queries.cview(), search_params);
+
+        size_t differing = 0;
+        for (size_t q = 0; q < queries.size(); ++q) {
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                if (reloaded_results.index(q, i) != original_results.index(q, i)) {
+                    ++differing;
+                }
+            }
+        }
+        CATCH_INFO("Mismatches: " << differing);
+        CATCH_REQUIRE(differing == 0);
+    }
 }

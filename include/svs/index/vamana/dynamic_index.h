@@ -1165,9 +1165,9 @@ class MutableVamanaIndex {
         );
 
         // After consolidation - set all `Deleted` slots to `Empty`.
-        for (auto& status : status_) {
-            if (status == SlotMetadata::Deleted) {
-                status = SlotMetadata::Empty;
+        for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
+            if (status_[i] == SlotMetadata::Deleted) {
+                status_[i] = SlotMetadata::Empty;
             }
         }
     }
