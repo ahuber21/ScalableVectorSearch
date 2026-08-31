@@ -523,64 +523,45 @@ CATCH_TEST_CASE(
 ) {
     using Idx = uint32_t;
     using Distance = svs::distance::DistanceL2;
-
-    using SeqSync = svs::index::vamana::SequentialSync;
-    using SeqGraph = svs::graphs::SimpleGraphBase<
+    using SharedGraph = svs::graphs::SimpleGraphBase<
         Idx,
         svs::data::SimpleData<Idx, svs::Dynamic>,
         svs::graphs::PlainAccess>;
-    using SeqData = svs::data::SimpleData<float, svs::Dynamic>;
+    using SharedData = svs::data::SimpleData<float, svs::Dynamic>;
+
+    using SeqSync = svs::index::vamana::SequentialSync;
     using SeqIndex =
-        svs::index::vamana::MutableVamanaIndex<SeqGraph, SeqData, Distance, SeqSync>;
+        svs::index::vamana::MutableVamanaIndex<SharedGraph, SharedData, Distance, SeqSync>;
 
     using SeqlockSync = svs::index::vamana::SeqlockSync;
     using SeqlockGraph = svs::graphs::SimpleGraphBase<
         Idx,
         svs::data::SimpleData<Idx, svs::Dynamic>,
         svs::graphs::SeqlockAccess>;
-    using SeqlockData = svs::data::SimpleData<float, svs::Dynamic>;
     using SeqlockIndex = svs::index::vamana::
-        MutableVamanaIndex<SeqlockGraph, SeqlockData, Distance, SeqlockSync>;
+        MutableVamanaIndex<SeqlockGraph, SharedData, Distance, SeqlockSync>;
 
     static_assert(std::is_move_constructible_v<SeqlockIndex>);
 
-    const size_t num_threads = 2;
     const size_t num_neighbors = 10;
     auto queries = test_dataset::queries();
+    auto groundtruth = test_dataset::groundtruth_euclidean();
     svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
     auto search_params = svs::index::vamana::VamanaSearchParameters{};
     search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
 
-    auto data_seq = test_dataset::data_f32();
-    auto data_seqlock = test_dataset::data_f32();
-    const size_t initial_size = data_seq.size();
-    std::vector<size_t> indices(initial_size);
-    std::iota(indices.begin(), indices.end(), 0);
-
-    auto seq_index =
-        SeqIndex(parameters, std::move(data_seq), indices, Distance(), num_threads);
-    auto seqlock_index =
-        SeqlockIndex(parameters, std::move(data_seqlock), indices, Distance(), num_threads);
-
-    CATCH_REQUIRE(seq_index.size() == initial_size);
-    CATCH_REQUIRE(seqlock_index.size() == initial_size);
-
-    auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
-    auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
-    auto groundtruth = test_dataset::groundtruth_euclidean();
-
-    auto compare_results = [&](const char* stage) {
-        auto seq_recall =
-            svs::k_recall_at_n(groundtruth, seq_results, num_neighbors, num_neighbors);
-        auto seqlock_recall =
-            svs::k_recall_at_n(groundtruth, seqlock_results, num_neighbors, num_neighbors);
+    auto compare_results = [&](const char* description,
+                               svs::QueryResult<size_t>& r1,
+                               svs::QueryResult<size_t>& r2) {
+        auto recall1 = svs::k_recall_at_n(groundtruth, r1, num_neighbors, num_neighbors);
+        auto recall2 = svs::k_recall_at_n(groundtruth, r2, num_neighbors, num_neighbors);
 
         size_t differing_queries = 0;
         size_t total_mismatches = 0;
         for (size_t q = 0; q < queries.size(); ++q) {
             bool query_differs = false;
             for (size_t i = 0; i < num_neighbors; ++i) {
-                if (seqlock_results.index(q, i) != seq_results.index(q, i)) {
+                if (r2.index(q, i) != r1.index(q, i)) {
                     ++total_mismatches;
                     query_differs = true;
                 }
@@ -592,72 +573,147 @@ CATCH_TEST_CASE(
 
         if (total_mismatches > 0) {
             CATCH_WARN(
-                stage << ": SeqlockSync diverges from SequentialSync: " << differing_queries
-                      << "/" << queries.size() << " queries differ, " << total_mismatches
-                      << " total mismatches. "
-                      << "Sequential recall: " << seq_recall
-                      << ", Seqlock recall: " << seqlock_recall
+                description << ": " << differing_queries << "/" << queries.size()
+                            << " queries differ, " << total_mismatches
+                            << " total mismatches. "
+                            << "Recall1: " << recall1 << ", Recall2: " << recall2
             );
         }
-        CATCH_REQUIRE(seq_recall > 0.0);
-        CATCH_REQUIRE(seqlock_recall > 0.0);
+        CATCH_REQUIRE(recall1 > 0.0);
+        CATCH_REQUIRE(recall2 > 0.0);
     };
 
-    seq_index.search(seq_results.view(), queries.cview(), search_params);
-    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
-    compare_results("Initial build");
+    CATCH_SECTION("Same-policy control: two SequentialSync builds") {
+        auto data1 = test_dataset::data_f32();
+        auto data2 = test_dataset::data_f32();
+        const size_t initial_size = data1.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
 
-    const size_t num_to_add = 5;
-    auto points_seq =
-        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seq_index.dimensions());
-    auto points_seqlock =
-        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seqlock_index.dimensions());
-    for (size_t i = 0; i < num_to_add; ++i) {
-        std::vector<float> datum(seq_index.dimensions());
-        for (size_t j = 0; j < seq_index.dimensions(); ++j) {
-            datum[j] = static_cast<float>(i + j);
+        auto index1 =
+            SeqIndex(parameters, std::move(data1), indices, Distance(), size_t{2});
+        auto index2 =
+            SeqIndex(parameters, std::move(data2), indices, Distance(), size_t{2});
+
+        auto results1 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto results2 = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        index1.search(results1.view(), queries.cview(), search_params);
+        index2.search(results2.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Same-policy control (SequentialSync, num_threads=2)", results1, results2
+        );
+    }
+
+    CATCH_SECTION("Cross-policy single-threaded") {
+        auto data_seq = test_dataset::data_f32();
+        auto data_seqlock = test_dataset::data_f32();
+        const size_t initial_size = data_seq.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto seq_index =
+            SeqIndex(parameters, std::move(data_seq), indices, Distance(), size_t{1});
+        auto seqlock_index = SeqlockIndex(
+            parameters, std::move(data_seqlock), indices, Distance(), size_t{1}
+        );
+
+        auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+
+        compare_results(
+            "Cross-policy (SequentialSync vs SeqlockSync, num_threads=1)",
+            seq_results,
+            seqlock_results
+        );
+    }
+
+    CATCH_SECTION("Cross-policy multi-threaded") {
+        auto data_seq = test_dataset::data_f32();
+        auto data_seqlock = test_dataset::data_f32();
+        const size_t initial_size = data_seq.size();
+        std::vector<size_t> indices(initial_size);
+        std::iota(indices.begin(), indices.end(), 0);
+
+        auto seq_index =
+            SeqIndex(parameters, std::move(data_seq), indices, Distance(), size_t{2});
+        auto seqlock_index = SeqlockIndex(
+            parameters, std::move(data_seqlock), indices, Distance(), size_t{2}
+        );
+
+        CATCH_REQUIRE(seq_index.size() == initial_size);
+        CATCH_REQUIRE(seqlock_index.size() == initial_size);
+
+        auto seq_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+        auto seqlock_results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: Initial build", seq_results, seqlock_results
+        );
+
+        const size_t num_to_add = 5;
+        auto points_seq =
+            svs::data::SimpleData<float, svs::Dynamic>(num_to_add, seq_index.dimensions());
+        auto points_seqlock = svs::data::SimpleData<float, svs::Dynamic>(
+            num_to_add, seqlock_index.dimensions()
+        );
+        for (size_t i = 0; i < num_to_add; ++i) {
+            std::vector<float> datum(seq_index.dimensions());
+            for (size_t j = 0; j < seq_index.dimensions(); ++j) {
+                datum[j] = static_cast<float>(i + j);
+            }
+            points_seq.set_datum(i, datum);
+            points_seqlock.set_datum(i, datum);
         }
-        points_seq.set_datum(i, datum);
-        points_seqlock.set_datum(i, datum);
-    }
-    std::vector<size_t> new_ids(num_to_add);
-    std::iota(new_ids.begin(), new_ids.end(), initial_size);
+        std::vector<size_t> new_ids(num_to_add);
+        std::iota(new_ids.begin(), new_ids.end(), initial_size);
 
-    seq_index.add_points(points_seq, new_ids);
-    seqlock_index.add_points(points_seqlock, new_ids);
+        seq_index.add_points(points_seq, new_ids);
+        seqlock_index.add_points(points_seqlock, new_ids);
 
-    CATCH_REQUIRE(seq_index.size() == initial_size + num_to_add);
-    CATCH_REQUIRE(seqlock_index.size() == initial_size + num_to_add);
+        CATCH_REQUIRE(seq_index.size() == initial_size + num_to_add);
+        CATCH_REQUIRE(seqlock_index.size() == initial_size + num_to_add);
 
-    for (const auto& id : new_ids) {
-        CATCH_REQUIRE(seq_index.has_id(id));
-        CATCH_REQUIRE(seqlock_index.has_id(id));
-    }
+        for (const auto& id : new_ids) {
+            CATCH_REQUIRE(seq_index.has_id(id));
+            CATCH_REQUIRE(seqlock_index.has_id(id));
+        }
 
-    seq_index.search(seq_results.view(), queries.cview(), search_params);
-    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
-    compare_results("After add");
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: After add", seq_results, seqlock_results
+        );
 
-    std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
-    seq_index.delete_entries(ids_to_delete);
-    seqlock_index.delete_entries(ids_to_delete);
+        std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
+        seq_index.delete_entries(ids_to_delete);
+        seqlock_index.delete_entries(ids_to_delete);
 
-    for (const auto& id : ids_to_delete) {
-        CATCH_REQUIRE(seq_index.is_deleted(id));
-        CATCH_REQUIRE(seqlock_index.is_deleted(id));
-    }
+        for (const auto& id : ids_to_delete) {
+            CATCH_REQUIRE(seq_index.is_deleted(id));
+            CATCH_REQUIRE(seqlock_index.is_deleted(id));
+        }
 
-    seq_index.search(seq_results.view(), queries.cview(), search_params);
-    seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
-    compare_results("After delete");
+        seq_index.search(seq_results.view(), queries.cview(), search_params);
+        seqlock_index.search(seqlock_results.view(), queries.cview(), search_params);
+        compare_results(
+            "Cross-policy multi-threaded: After delete", seq_results, seqlock_results
+        );
 
-    for (size_t q = 0; q < queries.size(); ++q) {
-        for (size_t i = 0; i < num_neighbors; ++i) {
-            const auto seqlock_id = seqlock_results.index(q, i);
-            CATCH_REQUIRE(
-                std::find(ids_to_delete.begin(), ids_to_delete.end(), seqlock_id) ==
-                ids_to_delete.end()
-            );
+        for (size_t q = 0; q < queries.size(); ++q) {
+            for (size_t i = 0; i < num_neighbors; ++i) {
+                const auto seqlock_id = seqlock_results.index(q, i);
+                CATCH_REQUIRE(
+                    std::find(ids_to_delete.begin(), ids_to_delete.end(), seqlock_id) ==
+                    ids_to_delete.end()
+                );
+            }
         }
     }
 }
