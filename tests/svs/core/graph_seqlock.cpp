@@ -322,6 +322,41 @@ CATCH_TEST_CASE("Seqlock access control negative test", "[graphs][seqlock]") {
     }
 }
 
+CATCH_TEST_CASE("Seqlock counter width prevents ABA on wrap", "[graphs][seqlock]") {
+    using Idx = uint32_t;
+    using SeqlockGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::SeqlockAccess>;
+
+    constexpr size_t n_nodes = 10;
+    constexpr size_t max_degree = 8;
+    constexpr Idx test_node = 5;
+
+    SeqlockGraph graph(n_nodes, max_degree);
+    std::vector<Idx> initial_state = {0, 1, 2, 3, 4};
+    graph.replace_node(test_node, initial_state);
+
+    // Regression test: WriteGuard truncating seq_ to uint8_t caused wrap after 256 writes,
+    // allowing read_validate to falsely accept a stale sequence value. Test boundary cases
+    // around powers of two to ensure the full counter width is preserved.
+    std::vector<size_t> test_values = {255, 256, 257, 512};
+    for (size_t N : test_values) {
+        auto seq_opt = graph.read_begin(test_node);
+        CATCH_REQUIRE(seq_opt.has_value());
+        auto captured_seq = seq_opt.value();
+
+        std::vector<Idx> dummy_state = {7, 8, 9};
+        for (size_t i = 0; i < N; ++i) {
+            auto guard = graph.write_guard(test_node);
+            graph.replace_node(test_node, dummy_state);
+        }
+
+        bool validated = graph.read_validate(test_node, captured_seq);
+        CATCH_REQUIRE(!validated);
+    }
+}
+
 CATCH_TEST_CASE("Reverse edges compile-time dispatch", "[graphs][seqlock]") {
     using Idx = uint32_t;
     using PlainGraph =

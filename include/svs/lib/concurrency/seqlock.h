@@ -38,9 +38,9 @@ namespace svs {
 /// lock (e.g., per-node ``SpinLock``) to serialize concurrent writers to the same element.
 ///
 class SeqLockCounter {
-    using counter_type = uint32_t;
-
   public:
+    /// Type for saved sequence values returned by `begin_write` and `read_begin`.
+    using counter_type = uint32_t;
     SeqLockCounter() = default;
 
     SeqLockCounter(const SeqLockCounter& other)
