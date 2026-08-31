@@ -473,7 +473,12 @@ CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
             Idx,
             svs::data::SimpleData<Idx, svs::Dynamic>,
             svs::graphs::SeqlockAccess>;
-        using Data = svs::data::SimpleData<float, svs::Dynamic>;
+        // SeqlockSync requires segment-stable growth so the lock-free searcher does not
+        // dereference freed memory after a reallocating resize.
+        using Data = svs::data::SimpleData<
+            float,
+            svs::Dynamic,
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>>;
         test_locking_impl<Graph, Data, SeqlockSync>();
     }
 }
@@ -609,7 +614,12 @@ CATCH_TEST_CASE(
         Idx,
         svs::data::SimpleData<Idx, svs::Dynamic>,
         svs::graphs::PlainAccess>;
-    using SharedData = svs::data::SimpleData<float, svs::Dynamic>;
+    // SeqlockSync requires segment-stable growth so the lock-free searcher does not
+    // dereference freed memory after a reallocating resize.
+    using SharedData = svs::data::SimpleData<
+        float,
+        svs::Dynamic,
+        svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>>;
 
     using SeqSync = svs::index::vamana::SequentialSync;
     using SeqIndex =
@@ -666,9 +676,17 @@ CATCH_TEST_CASE(
         CATCH_REQUIRE(std::abs(recall1 - recall2) <= 0.01);
     };
 
+    auto copy_to_grow_stable = [](const auto& source) {
+        SharedData dest(source.size(), source.dimensions());
+        for (size_t i = 0; i < source.size(); ++i) {
+            dest.set_datum(i, source.get_datum(i));
+        }
+        return dest;
+    };
+
     CATCH_SECTION("Same-policy control: single-threaded") {
-        auto data1 = test_dataset::data_f32();
-        auto data2 = test_dataset::data_f32();
+        auto data1 = copy_to_grow_stable(test_dataset::data_f32());
+        auto data2 = copy_to_grow_stable(test_dataset::data_f32());
         const size_t initial_size = data1.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -693,8 +711,8 @@ CATCH_TEST_CASE(
     }
 
     CATCH_SECTION("Same-policy control: multi-threaded") {
-        auto data1 = test_dataset::data_f32();
-        auto data2 = test_dataset::data_f32();
+        auto data1 = copy_to_grow_stable(test_dataset::data_f32());
+        auto data2 = copy_to_grow_stable(test_dataset::data_f32());
         const size_t initial_size = data1.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -719,8 +737,8 @@ CATCH_TEST_CASE(
     }
 
     CATCH_SECTION("Cross-policy single-threaded") {
-        auto data_seq = test_dataset::data_f32();
-        auto data_seqlock = test_dataset::data_f32();
+        auto data_seq = copy_to_grow_stable(test_dataset::data_f32());
+        auto data_seqlock = copy_to_grow_stable(test_dataset::data_f32());
         const size_t initial_size = data_seq.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -751,8 +769,8 @@ CATCH_TEST_CASE(
     CATCH_SECTION("Cross-policy multi-threaded") {
         // Multi-threaded builds are nondeterministic; only single-threaded arms
         // establish policy equivalence.
-        auto data_seq = test_dataset::data_f32();
-        auto data_seqlock = test_dataset::data_f32();
+        auto data_seq = copy_to_grow_stable(test_dataset::data_f32());
+        auto data_seqlock = copy_to_grow_stable(test_dataset::data_f32());
         const size_t initial_size = data_seq.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -854,7 +872,12 @@ CATCH_TEST_CASE(
     using Idx = uint32_t;
     using Distance = svs::distance::DistanceL2;
     using SeqGraph = svs::graphs::SimpleBlockedGraph<Idx>;
-    using SharedData = svs::data::SimpleData<float, svs::Dynamic>;
+    // SeqlockSync requires segment-stable growth so the lock-free searcher does not
+    // dereference freed memory after a reallocating resize.
+    using SharedData = svs::data::SimpleData<
+        float,
+        svs::Dynamic,
+        svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>>;
 
     using SeqSync = svs::index::vamana::SequentialSync;
     using SeqlockSync = svs::index::vamana::SeqlockSync;
@@ -867,10 +890,19 @@ CATCH_TEST_CASE(
     auto search_params = svs::index::vamana::VamanaSearchParameters{};
     search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
 
+    auto copy_to_grow_stable = [](const auto& source) {
+        SharedData dest(source.size(), source.dimensions());
+        for (size_t i = 0; i < source.size(); ++i) {
+            dest.set_datum(i, source.get_datum(i));
+        }
+        return dest;
+    };
+
     CATCH_SECTION("Compile-time check: auto_dynamic_assemble deduces SeqlockSync") {
         // On-disk format is policy-agnostic; policy must be supplied by caller at load
         // time.
-        auto data = test_dataset::data_f32();
+        auto source = test_dataset::data_f32();
+        auto data = copy_to_grow_stable(source);
         const size_t initial_size = data.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -912,7 +944,8 @@ CATCH_TEST_CASE(
     }
 
     CATCH_SECTION("Behavioral round trip: save SequentialSync, load as SeqlockSync") {
-        auto data = test_dataset::data_f32();
+        auto source = test_dataset::data_f32();
+        auto data = copy_to_grow_stable(source);
         const size_t initial_size = data.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
@@ -963,7 +996,8 @@ CATCH_TEST_CASE(
     }
 
     CATCH_SECTION("Same-policy round trip: build, save, and reload SeqlockSync") {
-        auto data = test_dataset::data_f32();
+        auto source = test_dataset::data_f32();
+        auto data = copy_to_grow_stable(source);
         const size_t initial_size = data.size();
         std::vector<size_t> indices(initial_size);
         std::iota(indices.begin(), indices.end(), 0);
