@@ -132,6 +132,7 @@ template <
 class MutableVamanaIndex {
     template <graphs::MemoryGraph, typename, typename, typename>
     friend class MultiMutableVamanaIndex;
+    template <typename, typename> friend class BatchIterator;
 
   public:
     // Traits
@@ -175,7 +176,12 @@ class MutableVamanaIndex {
     typename Sync::template container_type<SlotMetadata> status_;
     typename Sync::counter_type first_empty_;
     IDTranslator translator_;
+    // Lock order: compact_mutex_ → slot_alloc_mutex_ and compact_mutex_ →
+    // translator_mutex_. Violating this order causes deadlock; release compact_mutex_
+    // before acquiring others.
     [[no_unique_address]] typename Sync::mutex_type slot_alloc_mutex_;
+    [[no_unique_address]] mutable typename Sync::mutex_type translator_mutex_;
+    [[no_unique_address]] mutable typename Sync::mutex_type compact_mutex_;
 
     // Thread local data structures.
     distance_type distance_;
@@ -335,6 +341,15 @@ class MutableVamanaIndex {
 
     scratchspace_type scratchspace() const { return scratchspace(get_search_parameters()); }
 
+    ///// Locking Accessors
+    [[nodiscard]] std::shared_lock<typename Sync::mutex_type> lock_for_search() const {
+        return std::shared_lock<typename Sync::mutex_type>(compact_mutex_);
+    }
+
+    [[nodiscard]] std::shared_lock<typename Sync::mutex_type> lock_for_translation() const {
+        return std::shared_lock<typename Sync::mutex_type>(translator_mutex_);
+    }
+
     ///// Accessors
     /// @brief Getter method for logger
     svs::logging::logger_ptr get_logger() const { return logger_; }
@@ -398,6 +413,20 @@ class MutableVamanaIndex {
 
     ///// Index translation.
 
+  private:
+    // Unsafe translation functions: caller must hold translator_mutex_.
+    // Calling unlocked races with concurrent translator rewrites.
+    Idx unsafe_translate_external_id(size_t e) const { return translator_.get_internal(e); }
+
+    // Unsafe has_id: caller must hold translator_mutex_.
+    // Calling unlocked races with concurrent translator rewrites.
+    bool unsafe_has_id(size_t e) const { return translator_.has_external(e); }
+
+    // Unsafe translate_internal_id: caller must hold translator_mutex_.
+    // Calling unlocked races with concurrent translator rewrites.
+    size_t unsafe_translate_internal_id(Idx i) const { return translator_.get_external(i); }
+
+  public:
     ///
     /// @brief Get the internal ID mapped to be `e`.
     ///
@@ -407,12 +436,18 @@ class MutableVamanaIndex {
     ///
     /// @see has_id, translate_internal_id
     ///
-    Idx translate_external_id(size_t e) const { return translator_.get_internal(e); }
+    Idx translate_external_id(size_t e) const {
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
+        return unsafe_translate_external_id(e);
+    }
 
     ///
     /// @brief Check whether the external ID `e` exists in the index.
     ///
-    bool has_id(size_t e) const { return translator_.has_external(e); }
+    bool has_id(size_t e) const {
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
+        return unsafe_has_id(e);
+    }
 
     ///
     /// @brief Get the external ID mapped to be `i`.
@@ -421,7 +456,10 @@ class MutableVamanaIndex {
     ///
     /// Requires that mapping for `i` exists. Otherwise, all bets are off.
     ///
-    size_t translate_internal_id(Idx i) const { return translator_.get_external(i); }
+    size_t translate_internal_id(Idx i) const {
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
+        return unsafe_translate_internal_id(i);
+    }
 
     ///
     /// @brief Call the functor with all external IDs in the index.
@@ -430,6 +468,7 @@ class MutableVamanaIndex {
     ///     each external ID in the index.
     ///
     template <typename F> void on_ids(F&& f) const {
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
         for (auto pair : translator_) {
             f(pair.first);
         }
@@ -474,6 +513,7 @@ class MutableVamanaIndex {
         requires(std::tuple_size_v<Dims> == 2)
     void translate_to_external(DenseArray<size_t, Dims, Base>& ids) {
         // N.B.: lib::narrow_cast should be valid because the origin of the IDs is internal.
+        std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
         threads::parallel_for(
             threadpool_,
             threads::StaticPartition{getsize<0>(ids)},
@@ -481,7 +521,7 @@ class MutableVamanaIndex {
                 for (auto i : is) {
                     for (size_t j = 0, jmax = getsize<1>(ids); j < jmax; ++j) {
                         auto internal = lib::narrow_cast<Idx>(ids.at(i, j));
-                        ids.at(i, j) = translate_internal_id(internal);
+                        ids.at(i, j) = unsafe_translate_internal_id(internal);
                     }
                 }
             }
@@ -491,7 +531,11 @@ class MutableVamanaIndex {
     ///
     /// @brief Get the raw data for external id `e`.
     ///
-    auto get_datum(size_t e) const { return data_.get_datum(translate_external_id(e)); }
+    auto get_datum(size_t e) const {
+        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
+        std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+        return data_.get_datum(unsafe_translate_external_id(e));
+    }
 
     ///
     /// @brief Return the dimensionality of the stored dataset.
@@ -542,6 +586,7 @@ class MutableVamanaIndex {
         scratchspace_type& scratch,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) const {
+        std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
         extensions::single_search(
             data_,
             scratch.buffer,
@@ -559,36 +604,40 @@ class MutableVamanaIndex {
         const search_parameters_type& sp,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) {
-        threads::parallel_for(
-            threadpool_,
-            threads::StaticPartition{queries.size()},
-            [&](const auto is, uint64_t SVS_UNUSED(tid)) {
-                size_t num_neighbors = results.n_neighbors();
-                auto buffer =
-                    search_buffer_type{sp.buffer_config_, distance::comparator(distance_)};
+        {
+            std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
+            threads::parallel_for(
+                threadpool_,
+                threads::StaticPartition{queries.size()},
+                [&](const auto is, uint64_t SVS_UNUSED(tid)) {
+                    size_t num_neighbors = results.n_neighbors();
+                    auto buffer = search_buffer_type{
+                        sp.buffer_config_, distance::comparator(distance_)};
 
-                auto prefetch_parameters = GreedySearchPrefetchParameters{
-                    sp.prefetch_lookahead_, sp.prefetch_step_};
+                    auto prefetch_parameters = GreedySearchPrefetchParameters{
+                        sp.prefetch_lookahead_, sp.prefetch_step_};
 
-                // Legalize search buffer for this search.
-                if (buffer.target_capacity() < num_neighbors) {
-                    buffer.change_maxsize(num_neighbors);
+                    // Legalize search buffer for this search.
+                    if (buffer.target_capacity() < num_neighbors) {
+                        buffer.change_maxsize(num_neighbors);
+                    }
+                    auto scratch =
+                        extensions::per_thread_batch_search_setup(data_, distance_);
+
+                    extensions::per_thread_batch_search(
+                        data_,
+                        buffer,
+                        scratch,
+                        queries,
+                        results,
+                        threads::UnitRange{is},
+                        greedy_search_closure(prefetch_parameters, cancel),
+                        *this,
+                        cancel
+                    );
                 }
-                auto scratch = extensions::per_thread_batch_search_setup(data_, distance_);
-
-                extensions::per_thread_batch_search(
-                    data_,
-                    buffer,
-                    scratch,
-                    queries,
-                    results,
-                    threads::UnitRange{is},
-                    greedy_search_closure(prefetch_parameters, cancel),
-                    *this,
-                    cancel
-                );
-            }
-        );
+            );
+        }
 
         // Check if request to cancel the search
         if (cancel()) {
@@ -615,12 +664,15 @@ class MutableVamanaIndex {
         size_t num_neighbors,
         QueryResultView<I> result
     ) {
-        auto temp_index = temporary_flat_index(
-            data_, distance_, threads::ThreadPoolReferenceWrapper(threadpool_)
-        );
-        temp_index.search(queries, num_neighbors, result, [&](size_t i) {
-            return getindex(status_, i) == SlotMetadata::Valid;
-        });
+        {
+            std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
+            auto temp_index = temporary_flat_index(
+                data_, distance_, threads::ThreadPoolReferenceWrapper(threadpool_)
+            );
+            temp_index.search(queries, num_neighbors, result, [&](size_t i) {
+                return getindex(status_, i) == SlotMetadata::Valid;
+            });
+        }
 
         // After the search procedure, the indices in `results` are internal.
         // Perform one more pass to convert these to external ids.
@@ -752,7 +804,10 @@ class MutableVamanaIndex {
         // Try to update the id translation now that we have internal ids.
         // If this fails, we still haven't mutated the index data structure so we're safe
         // to throw an exception.
-        translator_.insert(external_ids, slots);
+        {
+            std::unique_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+            translator_.insert(external_ids, slots);
+        }
 
         // Copy the given points into the data and clear the adjacency lists for the graph.
         copy_points(points, slots);
@@ -817,12 +872,15 @@ class MutableVamanaIndex {
     ///   graph.
     ///
     template <typename T> size_t delete_entries(const T& ids) {
-        translator_.check_external_exist(ids.begin(), ids.end());
-        for (auto i : ids) {
-            delete_entry(translator_.get_internal(i));
-        }
-        if constexpr (!Sync::defers_translator_cleanup) {
-            translator_.delete_external(ids);
+        {
+            std::unique_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+            translator_.check_external_exist(ids.begin(), ids.end());
+            for (auto i : ids) {
+                delete_entry(translator_.get_internal(i));
+            }
+            if constexpr (!Sync::defers_translator_cleanup) {
+                translator_.delete_external(ids);
+            }
         }
         return ids.size();
     }
@@ -863,6 +921,7 @@ class MutableVamanaIndex {
     ///     improve performance but requires more working memory.
     ///
     void compact(Idx batch_size = 1'000) {
+        std::unique_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
         // Step 1: Compute a prefix-sum matching each valid internal index to its new
         // internal index.
         //
@@ -942,17 +1001,20 @@ class MutableVamanaIndex {
         first_empty_.store(max_index);
 
         // Compact metadata and ID remapping.
-        for (size_t new_id = 0; new_id < max_index; ++new_id) {
-            auto old_id = getindex(new_to_old_id_map, new_id);
-            // No work to be done if there was no remapping.
-            if (new_id == old_id) {
-                continue;
-            }
+        {
+            std::unique_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+            for (size_t new_id = 0; new_id < max_index; ++new_id) {
+                auto old_id = getindex(new_to_old_id_map, new_id);
+                // No work to be done if there was no remapping.
+                if (new_id == old_id) {
+                    continue;
+                }
 
-            auto status = getindex(status_, old_id);
-            status_[new_id] = status;
-            if (status == SlotMetadata::Valid) {
-                translator_.remap_internal_id(old_id, new_id);
+                auto status = getindex(status_, old_id);
+                status_[new_id] = status;
+                if (status == SlotMetadata::Valid) {
+                    translator_.remap_internal_id(old_id, new_id);
+                }
             }
         }
         status_.resize(max_index);
@@ -1215,20 +1277,25 @@ class MutableVamanaIndex {
         }
 
         // Bounds checking.
-        for (size_t i = 0; i < ids_size; ++i) {
-            I id = ids[i]; // inbounds by loop bounds.
-            if (!has_id(id)) {
-                throw ANNEXCEPTION("ID {} with value {} is out of bounds!", i, id);
+        {
+            std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+            for (size_t i = 0; i < ids_size; ++i) {
+                I id = ids[i]; // inbounds by loop bounds.
+                if (!unsafe_has_id(id)) {
+                    throw ANNEXCEPTION("ID {} with value {} is out of bounds!", i, id);
+                }
             }
         }
 
         // Prerequisites checked - proceed with the operation.
         // TODO: Communicate the requested decompression type to the backend dataset to
         // allow more fine-grained specialization?
+        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
+        std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
         auto threaded_function = [&](auto is, uint64_t SVS_UNUSED(tid)) {
             auto accessor = extensions::reconstruct_accessor(data_);
             for (auto i : is) {
-                auto id = translate_external_id(ids[i]);
+                auto id = unsafe_translate_external_id(ids[i]);
                 dst.set_datum(i, accessor(data_, id));
             }
         };
@@ -1347,10 +1414,13 @@ class MutableVamanaIndex {
     template <typename ExternalId, typename Query>
     double get_distance(const ExternalId& external_id, const Query& query) const {
         // Check if the external ID exists
-        if (!has_id(external_id)) {
-            throw ANNEXCEPTION(
-                "ID {} is out of bounds for index of size {}!", external_id, size()
-            );
+        {
+            std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+            if (!unsafe_has_id(external_id)) {
+                throw ANNEXCEPTION(
+                    "ID {} is out of bounds for index of size {}!", external_id, size()
+                );
+            }
         }
         // Verify dimensions match
         const size_t query_size = query.size();
@@ -1363,8 +1433,10 @@ class MutableVamanaIndex {
             );
         }
 
-        // Translate external ID to internal ID
-        auto internal_id = translate_external_id(external_id);
+        // Translate external ID to internal ID and compute distance
+        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
+        std::shared_lock<typename Sync::mutex_type> translator_lock(translator_mutex_);
+        auto internal_id = unsafe_translate_external_id(external_id);
 
         // Call extension for distance computation
         return extensions::get_distance_ext(data_, distance_, internal_id, query);

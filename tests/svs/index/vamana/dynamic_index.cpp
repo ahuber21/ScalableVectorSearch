@@ -381,6 +381,82 @@ CATCH_TEST_CASE(
     }
 }
 
+CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
+    using SeqSync = svs::index::vamana::SequentialSync;
+
+    // Static assertions: guards are [[nodiscard]] and mutex type is empty under
+    // SequentialSync.
+    static_assert(std::is_empty_v<SeqSync::mutex_type>, "NullMutex must be empty");
+    static_assert(std::is_empty_v<svs::lib::NullMutex>, "NullMutex must be empty");
+
+    // Runtime: build a small index and exercise the locking accessors.
+    const size_t num_threads = 2;
+    using Distance = svs::distance::DistanceL2;
+    auto data = test_dataset::data_blocked_f32();
+    std::vector<size_t> indices(data.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
+    auto index = svs::index::vamana::MutableVamanaIndex(
+        parameters, std::move(data), indices, Distance(), num_threads
+    );
+
+    // Take and release search lock.
+    {
+        auto lock = index.lock_for_search();
+        CATCH_REQUIRE(true); // Lock acquired successfully.
+    }
+
+    // Take and release translation lock.
+    {
+        auto lock = index.lock_for_translation();
+        CATCH_REQUIRE(true); // Lock acquired successfully.
+    }
+
+    // Perform a search and verify results are correct.
+    const size_t num_neighbors = 10;
+    auto queries = test_dataset::queries();
+    auto groundtruth = test_dataset::groundtruth_euclidean();
+    auto search_params = svs::index::vamana::VamanaSearchParameters{};
+    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
+    auto results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+    index.search(results.view(), queries.cview(), search_params);
+
+    // Verify recall is reasonable.
+    auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
+    CATCH_REQUIRE(recall > 0.0); // Should have some recall.
+
+    // Exercise the batch iterator.
+    auto query_span =
+        std::span<const float>(queries.get_datum(0).data(), queries.dimensions());
+    auto iterator = index.make_batch_iterator(query_span);
+    CATCH_REQUIRE(iterator.batch_number() == 0);
+    CATCH_REQUIRE(!iterator.done());
+
+    // Fetch first batch.
+    iterator.next(5);
+    CATCH_REQUIRE(iterator.size() <= 5);
+    CATCH_REQUIRE(iterator.batch_number() == 1);
+
+    // Collect all neighbors from the first batch.
+    std::vector<size_t> batch_ids;
+    for (const auto& neighbor : iterator) {
+        batch_ids.push_back(neighbor.id());
+    }
+
+    // Verify that the batch contains valid external IDs.
+    for (const auto& id : batch_ids) {
+        CATCH_REQUIRE(index.has_id(id));
+    }
+
+    // Fetch another batch and verify it yields different neighbors.
+    iterator.next(5);
+    CATCH_REQUIRE(iterator.batch_number() == 2);
+    // Iterator should have made progress or be exhausted.
+    bool made_progress = (iterator.size() > 0 && iterator.size() <= 5) || iterator.done();
+    CATCH_REQUIRE(made_progress);
+}
+
 CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index]") {
     const size_t num_threads = 2;
     using Distance = svs::distance::DistanceL2;

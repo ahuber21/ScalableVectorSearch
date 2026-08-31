@@ -28,6 +28,12 @@
 
 namespace svs::index::vamana {
 
+template <typename Index>
+concept LockableIndex = requires(const Index& index) {
+                            index.lock_for_search();
+                            index.lock_for_translation();
+                        };
+
 /// @brief A graph search initializer that uses the existing contents of the search buffer
 /// to initialize the next round of graph search.
 ///
@@ -137,6 +143,64 @@ template <typename Index, typename QueryType> class BatchIterator {
         scratchspace_.buffer.change_maxsize(config);
     }
 
+    /// @brief Executes the search over the index using experimental_escape_hatch.
+    void run_search(
+        bool restart_search_copy,
+        const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
+    ) {
+        parent_->experimental_escape_hatch([&]<std::integral I>(
+                                               const auto& graph,
+                                               const auto& data,
+                                               const auto& SVS_UNUSED(distance),
+                                               std::span<const I> entry_points
+                                           ) {
+            auto search_closure =
+                [&](const auto& query, const auto& accessor, auto& d, auto& buffer) {
+                    constexpr vamana::extensions::UsesReranking<
+                        std::remove_const_t<std::remove_reference_t<decltype(data)>>>
+                        uses_reranking{};
+                    if constexpr (uses_reranking()) {
+                        distance::maybe_fix_argument(d, query);
+                        for (size_t j = 0, jmax = buffer.size(); j < jmax; ++j) {
+                            auto& neighbor = buffer[j];
+                            auto id = neighbor.id();
+                            auto new_distance =
+                                distance::compute(d, query, data.get_primary(id));
+                            neighbor.set_distance(new_distance);
+                        }
+                        buffer.sort();
+                    }
+
+                    vamana::greedy_search(
+                        graph,
+                        data,
+                        accessor,
+                        query,
+                        d,
+                        buffer,
+                        RestartInitializer<I>{entry_points, restart_search_copy},
+                        parent_->internal_search_builder(),
+                        scratchspace_.prefetch_parameters,
+                        cancel
+                    );
+
+                    if constexpr (Index::needs_id_translation) {
+                        buffer.cleanup();
+                        buffer.sort();
+                    }
+                };
+
+            extensions::single_search(
+                data,
+                scratchspace_.buffer,
+                scratchspace_.scratch,
+                lib::as_const_span(query_),
+                search_closure,
+                *parent_
+            );
+        });
+    }
+
   public:
     using size_type = typename result_buffer_type::size_type;
     using reference = value_type&;
@@ -187,10 +251,18 @@ template <typename Index, typename QueryType> class BatchIterator {
     }
 
     /// @brief Adapts an internal neighbor to an external neighbor.
+    /// When locking is supported, must be called with lock_for_translation() already held.
+    /// Uses unsafe_translate_internal_id to avoid recursive locking on translator_mutex_.
     template <NeighborLike N> svs::Neighbor<external_id_type> adapt(N internal) const {
         if constexpr (Index::needs_id_translation) {
-            return Neighbor<external_id_type>{
-                parent_->translate_internal_id(internal.id()), internal.distance()};
+            if constexpr (LockableIndex<Index>) {
+                return Neighbor<external_id_type>{
+                    parent_->unsafe_translate_internal_id(internal.id()),
+                    internal.distance()};
+            } else {
+                return Neighbor<external_id_type>{
+                    parent_->translate_internal_id(internal.id()), internal.distance()};
+            }
         } else {
             return internal;
         }
@@ -257,61 +329,29 @@ template <typename Index, typename QueryType> class BatchIterator {
 
         bool restart_search_copy = std::exchange(restart_search_, true);
 
-        parent_->experimental_escape_hatch([&]<std::integral I>(
-                                               const auto& graph,
-                                               const auto& data,
-                                               const auto& SVS_UNUSED(distance),
-                                               std::span<const I> entry_points
-                                           ) {
-            auto search_closure =
-                [&](const auto& query, const auto& accessor, auto& d, auto& buffer) {
-                    constexpr vamana::extensions::UsesReranking<
-                        std::remove_const_t<std::remove_reference_t<decltype(data)>>>
-                        uses_reranking{};
-                    if constexpr (uses_reranking()) {
-                        distance::maybe_fix_argument(d, query);
-                        for (size_t j = 0, jmax = buffer.size(); j < jmax; ++j) {
-                            auto& neighbor = buffer[j];
-                            auto id = neighbor.id();
-                            auto new_distance =
-                                distance::compute(d, query, data.get_primary(id));
-                            neighbor.set_distance(new_distance);
-                        }
-                        buffer.sort();
-                    }
+        // Search phase: lock compact_mutex_ if supported to protect data/graph access.
+        // Translation phase follows separately to respect lock order.
+        if constexpr (LockableIndex<Index>) {
+            {
+                auto search_lock = parent_->lock_for_search();
+                run_search(restart_search_copy, cancel);
+            }
+            ++iteration_;
+            restart_search_ = false;
+            // Translation phase: lock translator_mutex_ separately.
+            // Guards are not nested to respect lock order compact_mutex_ →
+            // translator_mutex_.
+            {
+                auto translation_lock = parent_->lock_for_translation();
+                copy_from_scratch(batch_size);
+            }
+        } else {
+            run_search(restart_search_copy, cancel);
+            ++iteration_;
+            restart_search_ = false;
+            copy_from_scratch(batch_size);
+        }
 
-                    vamana::greedy_search(
-                        graph,
-                        data,
-                        accessor,
-                        query,
-                        d,
-                        buffer,
-                        RestartInitializer<I>{entry_points, restart_search_copy},
-                        parent_->internal_search_builder(),
-                        scratchspace_.prefetch_parameters,
-                        cancel
-                    );
-
-                    if constexpr (Index::needs_id_translation) {
-                        buffer.cleanup();
-                        buffer.sort();
-                    }
-                };
-
-            extensions::single_search(
-                data,
-                scratchspace_.buffer,
-                scratchspace_.scratch,
-                lib::as_const_span(query_),
-                search_closure,
-                *parent_
-            );
-        });
-
-        ++iteration_;
-        restart_search_ = false;
-        copy_from_scratch(batch_size);
         // If result is empty after calling next(), mark the iterator as exhausted.
         // The iterator will not be able to find any more neighbors.
         if (results_.size() == 0 && batch_size > 0) {
