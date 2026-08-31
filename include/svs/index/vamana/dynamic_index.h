@@ -164,6 +164,9 @@ class MutableVamanaIndex {
     using graph_type = Graph;
     using data_type = Data;
     using entry_point_type = std::vector<Idx>;
+    // The element type is policy-dependent: SeqlockSync wraps it to make each access
+    // atomic, so size accounting must go through value_type rather than SlotMetadata.
+    using status_type = typename Sync::template container_type<SlotMetadata>;
     /// The type of the configurable search parameters.
     using search_parameters_type = VamanaSearchParameters;
     using inner_scratch_type =
@@ -182,7 +185,7 @@ class MutableVamanaIndex {
     graph_type graph_;
     data_type data_;
     entry_point_type entry_point_;
-    typename Sync::template container_type<SlotMetadata> status_;
+    status_type status_;
     typename Sync::counter_type first_empty_;
     IDTranslator translator_;
     // Lock order: compact_mutex_ → slot_alloc_mutex_ and compact_mutex_ →
@@ -382,7 +385,8 @@ class MutableVamanaIndex {
         usage.graph_bytes = svs::data::detail::dataset_allocated_bytes(graph_.get_data());
         usage.data_bytes = svs::data::detail::dataset_allocated_bytes(data_);
 
-        size_t metadata_bytes = status_.capacity() * sizeof(SlotMetadata);
+        size_t metadata_bytes =
+            status_.capacity() * sizeof(typename status_type::value_type);
         metadata_bytes +=
             entry_point_.capacity() * sizeof(typename entry_point_type::value_type);
         // The IDTranslator holds two tsl::robin_map instances (external->internal and
@@ -562,9 +566,7 @@ class MutableVamanaIndex {
     // Return a `greedy_search` compatible builder for this index.
     // This is an internal method, mostly used to help implement the batch iterator.
     auto internal_search_builder() const {
-        return ValidBuilder<
-            typename Sync::template container_type<SlotMetadata>,
-            Sync::reserves_pending_slots>{status_};
+        return ValidBuilder<status_type, Sync::reserves_pending_slots>{status_};
     }
 
     auto greedy_search_closure(
@@ -737,15 +739,12 @@ class MutableVamanaIndex {
     // RAII guard to release Pending slots if add_points throws.
     // Prevents leaking capacity when reservation succeeds but population fails.
     class PendingSlotGuard {
-        typename Sync::template container_type<SlotMetadata>& status_;
+        status_type& status_;
         const std::vector<size_t>& slots_;
         bool committed_ = false;
 
       public:
-        PendingSlotGuard(
-            typename Sync::template container_type<SlotMetadata>& status,
-            const std::vector<size_t>& slots
-        )
+        PendingSlotGuard(status_type& status, const std::vector<size_t>& slots)
             : status_(status)
             , slots_(slots) {}
 

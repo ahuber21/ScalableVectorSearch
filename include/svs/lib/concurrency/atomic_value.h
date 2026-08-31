@@ -45,10 +45,8 @@ template <typename T> class AtomicValue {
     AtomicValue(T value)
         : value_{value} {}
 
-    // Copy and assignment via load-then-store. Required because `SegmentedVector` calls
-    // `new (p) T(*fill)` and `new (p) T(other[i])`, and a non-copyable element type does
-    // not compile. Move operations must fall back to copy; declaring them would delete
-    // the copy operations or silently convert to a relaxed-order load.
+    // Copy via load-then-store, because `SegmentedVector` constructs elements with
+    // `new (p) T(...)` and rejects a non-copyable element type. Moves fall back to copy.
     AtomicValue(const AtomicValue& other)
         : value_{other.value_.load(std::memory_order_acquire)} {}
 
@@ -59,9 +57,8 @@ template <typename T> class AtomicValue {
         return *this;
     }
 
-    // Implicit conversion to T via acquire load. Every comparison against an enumerator
-    // must work through this conversion; declaring `operator==` on the wrapper risks
-    // ambiguity with the converting constructor.
+    // Implicit conversion keeps existing comparisons against an enumerator compiling.
+    // Declaring `operator==` instead would be ambiguous with the converting constructor.
     operator T() const { return value_.load(std::memory_order_acquire); }
 
     // Assignment from T via release store. The lock-free reader sees the write atomically.
