@@ -26,7 +26,6 @@
 #include "svs/index/vamana/prune.h"
 #include "svs/index/vamana/search_buffer.h"
 #include "svs/index/vamana/search_tracker.h"
-#include "svs/index/vamana/sync_policy.h"
 #include "svs/lib/boundscheck.h"
 #include "svs/lib/exception.h"
 #include "svs/lib/narrow.h"
@@ -166,8 +165,7 @@ template <
     graphs::MemoryGraph Graph,
     data::ImmutableMemoryDataset Data,
     typename Dist,
-    threads::ThreadPool Pool,
-    typename Sync = SequentialSync>
+    threads::ThreadPool Pool>
 class VamanaBuilder {
   public:
     // Type Aliases
@@ -596,8 +594,9 @@ class VamanaBuilder {
     GreedySearchPrefetchParameters prefetch_hint_;
     /// Worker threadpool.
     Pool& threadpool_;
-    /// Per-vertex locks.
-    std::vector<typename Sync::mutex_type> vertex_locks_;
+    // Serializes concurrent back-edge insertion in add_reverse_edges. The back-edge loop
+    // runs under parallel_for; a no-op lock here races on shared adjacency lists.
+    std::vector<SpinLock> vertex_locks_;
     /// Overflow backedge buffer.
     BackedgeBuffer<Idx> backedge_buffer_;
 };
