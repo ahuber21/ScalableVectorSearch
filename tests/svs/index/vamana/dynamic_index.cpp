@@ -381,39 +381,33 @@ CATCH_TEST_CASE(
     }
 }
 
-CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
-    using SeqSync = svs::index::vamana::SequentialSync;
-
-    // Static assertions: guards are [[nodiscard]] and mutex type is empty under
-    // SequentialSync.
-    static_assert(std::is_empty_v<SeqSync::mutex_type>, "NullMutex must be empty");
-    static_assert(std::is_empty_v<svs::lib::NullMutex>, "NullMutex must be empty");
-
-    // Runtime: build a small index and exercise the locking accessors.
+namespace {
+template <typename Graph, typename Data, typename Sync> void test_locking_impl() {
     const size_t num_threads = 2;
     using Distance = svs::distance::DistanceL2;
-    auto data = test_dataset::data_blocked_f32();
+    auto source_data = test_dataset::data_f32();
+    auto data = Data(source_data.size(), source_data.dimensions());
+    for (size_t i = 0; i < source_data.size(); ++i) {
+        data.set_datum(i, source_data.get_datum(i));
+    }
     std::vector<size_t> indices(data.size());
     std::iota(indices.begin(), indices.end(), 0);
 
     svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
-    auto index = svs::index::vamana::MutableVamanaIndex(
+    auto index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Distance, Sync>(
         parameters, std::move(data), indices, Distance(), num_threads
     );
 
-    // Take and release search lock.
     {
         auto lock = index.lock_for_search();
-        CATCH_REQUIRE(true); // Lock acquired successfully.
+        CATCH_REQUIRE(true);
     }
 
-    // Take and release translation lock.
     {
         auto lock = index.lock_for_translation();
-        CATCH_REQUIRE(true); // Lock acquired successfully.
+        CATCH_REQUIRE(true);
     }
 
-    // Perform a search and verify results are correct.
     const size_t num_neighbors = 10;
     auto queries = test_dataset::queries();
     auto groundtruth = test_dataset::groundtruth_euclidean();
@@ -422,39 +416,56 @@ CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
     auto results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
     index.search(results.view(), queries.cview(), search_params);
 
-    // Verify recall is reasonable.
     auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
-    CATCH_REQUIRE(recall > 0.0); // Should have some recall.
+    CATCH_REQUIRE(recall > 0.0);
 
-    // Exercise the batch iterator.
     auto query_span =
         std::span<const float>(queries.get_datum(0).data(), queries.dimensions());
     auto iterator = index.make_batch_iterator(query_span);
     CATCH_REQUIRE(iterator.batch_number() == 0);
     CATCH_REQUIRE(!iterator.done());
 
-    // Fetch first batch.
     iterator.next(5);
     CATCH_REQUIRE(iterator.size() <= 5);
     CATCH_REQUIRE(iterator.batch_number() == 1);
 
-    // Collect all neighbors from the first batch.
     std::vector<size_t> batch_ids;
     for (const auto& neighbor : iterator) {
         batch_ids.push_back(neighbor.id());
     }
 
-    // Verify that the batch contains valid external IDs.
     for (const auto& id : batch_ids) {
         CATCH_REQUIRE(index.has_id(id));
     }
 
-    // Fetch another batch and verify it yields different neighbors.
     iterator.next(5);
     CATCH_REQUIRE(iterator.batch_number() == 2);
-    // Iterator should have made progress or be exhausted.
     bool made_progress = (iterator.size() > 0 && iterator.size() <= 5) || iterator.done();
     CATCH_REQUIRE(made_progress);
+}
+} // namespace
+
+CATCH_TEST_CASE("MutableVamana Index Locking", "[index][vamana]") {
+    using SeqSync = svs::index::vamana::SequentialSync;
+    static_assert(std::is_empty_v<SeqSync::mutex_type>, "NullMutex must be empty");
+    static_assert(std::is_empty_v<svs::lib::NullMutex>, "NullMutex must be empty");
+
+    CATCH_SECTION("SequentialSync") {
+        using Graph = svs::graphs::SimpleBlockedGraph<uint32_t>;
+        using Data = svs::data::BlockedData<float>;
+        test_locking_impl<Graph, Data, SeqSync>();
+    }
+
+    CATCH_SECTION("SeqlockSync") {
+        using Idx = uint32_t;
+        using SeqlockSync = svs::index::vamana::SeqlockSync;
+        using Graph = svs::graphs::SimpleGraphBase<
+            Idx,
+            svs::data::SimpleData<Idx, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+        using Data = svs::data::SimpleData<float, svs::Dynamic>;
+        test_locking_impl<Graph, Data, SeqlockSync>();
+    }
 }
 
 CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index]") {
@@ -495,4 +506,87 @@ CATCH_TEST_CASE("MutableVamana Index Memory Usage", "[graph_index][dynamic_index
     CATCH_REQUIRE(breakdown.total() == expected_total_bytes);
     const size_t usage = index.get_memory_breakdown().total();
     CATCH_REQUIRE(usage == expected_total_bytes);
+}
+
+CATCH_TEST_CASE(
+    "MutableVamana Index SeqlockSync Instantiation", "[index][vamana][sync_policy]"
+) {
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+    using SeqlockSync = svs::index::vamana::SeqlockSync;
+    using SeqlockGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::SeqlockAccess>;
+    using SeqlockData = svs::data::SimpleData<float, svs::Dynamic>;
+    using SeqlockIndex = svs::index::vamana::
+        MutableVamanaIndex<SeqlockGraph, SeqlockData, Distance, SeqlockSync>;
+
+    static_assert(std::is_move_constructible_v<SeqlockIndex>);
+
+    const size_t num_threads = 2;
+    auto data = test_dataset::data_f32();
+    const size_t initial_size = data.size();
+    std::vector<size_t> indices(initial_size);
+    std::iota(indices.begin(), indices.end(), 0);
+
+    svs::index::vamana::VamanaBuildParameters parameters{1.2, 64, 10, 20, 10, true};
+    auto index =
+        SeqlockIndex(parameters, std::move(data), indices, Distance(), num_threads);
+
+    CATCH_REQUIRE(index.size() == initial_size);
+
+    const size_t num_neighbors = 10;
+    auto queries = test_dataset::queries();
+    auto groundtruth = test_dataset::groundtruth_euclidean();
+    auto search_params = svs::index::vamana::VamanaSearchParameters{};
+    search_params.buffer_config_ = svs::index::vamana::SearchBufferConfig{num_neighbors};
+    auto results = svs::QueryResult<size_t>(queries.size(), num_neighbors);
+    index.search(results.view(), queries.cview(), search_params);
+
+    auto recall = svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
+    CATCH_REQUIRE(recall > 0.0);
+
+    const size_t num_to_add = 5;
+    auto points_to_add =
+        svs::data::SimpleData<float, svs::Dynamic>(num_to_add, index.dimensions());
+    for (size_t i = 0; i < num_to_add; ++i) {
+        std::vector<float> datum(index.dimensions());
+        for (size_t j = 0; j < index.dimensions(); ++j) {
+            datum[j] = static_cast<float>(i + j);
+        }
+        points_to_add.set_datum(i, datum);
+    }
+    std::vector<size_t> new_ids(num_to_add);
+    std::iota(new_ids.begin(), new_ids.end(), initial_size);
+
+    index.add_points(points_to_add, new_ids);
+    CATCH_REQUIRE(index.size() == initial_size + num_to_add);
+
+    for (const auto& id : new_ids) {
+        CATCH_REQUIRE(index.has_id(id));
+    }
+
+    index.search(results.view(), queries.cview(), search_params);
+    auto recall_after_add =
+        svs::k_recall_at_n(groundtruth, results, num_neighbors, num_neighbors);
+    CATCH_REQUIRE(recall_after_add > 0.0);
+
+    std::vector<size_t> ids_to_delete{new_ids.begin(), new_ids.begin() + 3};
+    index.delete_entries(ids_to_delete);
+
+    for (const auto& id : ids_to_delete) {
+        CATCH_REQUIRE(index.is_deleted(id));
+    }
+
+    index.search(results.view(), queries.cview(), search_params);
+    for (size_t q = 0; q < queries.size(); ++q) {
+        for (size_t i = 0; i < num_neighbors; ++i) {
+            const auto result_id = results.index(q, i);
+            CATCH_REQUIRE(
+                std::find(ids_to_delete.begin(), ids_to_delete.end(), result_id) ==
+                ids_to_delete.end()
+            );
+        }
+    }
 }
