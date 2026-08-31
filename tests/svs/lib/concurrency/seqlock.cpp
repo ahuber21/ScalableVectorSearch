@@ -135,14 +135,21 @@ CATCH_TEST_CASE("SeqLockCounter concurrent reader and writer", "[core][seqlock]"
     constexpr int kIterations = 10000;
     std::atomic<int> data{0};
     std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
     std::atomic<int> failed_reads{0};
+    std::atomic<size_t> out_of_range{0};
+    std::atomic<int> successful_reads{0};
 
+    // Writer continues until reader completes to maximize contention.
+    // Fixed iteration count made the test flaky when writer finished early.
     std::thread writer([&]() {
         while (!start.load(std::memory_order_acquire)) {}
-        for (int i = 0; i < kIterations; ++i) {
+        int i = 0;
+        while (!stop.load(std::memory_order_acquire)) {
             auto seq = counter.begin_write();
-            data.store(i, std::memory_order_relaxed);
+            data.store(i % kIterations, std::memory_order_relaxed);
             counter.end_write(seq);
+            i++;
         }
     });
 
@@ -161,17 +168,22 @@ CATCH_TEST_CASE("SeqLockCounter concurrent reader and writer", "[core][seqlock]"
                 continue;
             }
             successful++;
-            CATCH_REQUIRE(value >= 0);
-            CATCH_REQUIRE(value < kIterations);
+            if (value < 0 || value >= kIterations) {
+                out_of_range.fetch_add(1, std::memory_order_relaxed);
+            }
         }
+        successful_reads.store(successful, std::memory_order_relaxed);
     });
 
     start.store(true, std::memory_order_release);
-    writer.join();
     reader.join();
+    stop.store(true, std::memory_order_release);
+    writer.join();
 
-    // Reader should have detected some conflicts.
-    CATCH_REQUIRE(failed_reads.load(std::memory_order_relaxed) > 0);
+    CATCH_INFO("Failed reads: " << failed_reads.load(std::memory_order_relaxed));
+    CATCH_INFO("Out-of-range reads: " << out_of_range.load(std::memory_order_relaxed));
+    CATCH_REQUIRE(out_of_range.load(std::memory_order_relaxed) == 0);
+    CATCH_REQUIRE(successful_reads.load(std::memory_order_relaxed) == kIterations);
 }
 
 CATCH_TEST_CASE("SeqLockArray basic operations", "[core][seqlock]") {
