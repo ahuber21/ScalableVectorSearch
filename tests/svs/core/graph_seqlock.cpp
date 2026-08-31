@@ -100,7 +100,7 @@ CATCH_TEST_CASE("Plain mode identical behavior", "[graphs][seqlock]") {
     }
 }
 
-CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock][!mayfail]") {
+CATCH_TEST_CASE("Seqlock torn-read test", "[graphs][seqlock]") {
     using Idx = uint32_t;
     using SeqlockGraph = svs::graphs::SimpleGraphBase<
         Idx,
@@ -250,4 +250,62 @@ CATCH_TEST_CASE("SeqlockVisitor retries on validation failure", "[graphs][seqloc
     visitor(5, [&]() { ++executions; });
 
     CATCH_REQUIRE(executions > 0);
+}
+
+CATCH_TEST_CASE("Seqlock access control negative test", "[graphs][seqlock]") {
+    using Idx = uint32_t;
+    using PlainGraph =
+        svs::graphs::SimpleGraphBase<Idx, svs::data::SimpleData<Idx, svs::Dynamic>>;
+    using SeqlockGraph = svs::graphs::SimpleGraphBase<
+        Idx,
+        svs::data::SimpleData<Idx, svs::Dynamic>,
+        svs::graphs::SeqlockAccess>;
+
+    constexpr size_t n_nodes = 10;
+    constexpr size_t max_degree = 5;
+    constexpr Idx test_node = 3;
+
+    CATCH_SECTION("SeqlockAccess blocks read_begin during write") {
+        SeqlockGraph graph(n_nodes, max_degree);
+        std::vector<Idx> initial_state = {0, 1, 2, 3, 4};
+        graph.replace_node(test_node, initial_state);
+
+        auto guard = graph.write_guard(test_node);
+        auto seq_opt = graph.read_begin(test_node);
+        CATCH_REQUIRE(!seq_opt.has_value());
+    }
+
+    CATCH_SECTION("SeqlockAccess detects intervening write") {
+        SeqlockGraph graph(n_nodes, max_degree);
+        std::vector<Idx> initial_state = {0, 1, 2, 3, 4};
+        std::vector<Idx> modified_state = {5, 6, 7, 8, 9};
+        graph.replace_node(test_node, initial_state);
+
+        auto seq_opt = graph.read_begin(test_node);
+        CATCH_REQUIRE(seq_opt.has_value());
+
+        {
+            auto guard = graph.write_guard(test_node);
+            graph.replace_node(test_node, modified_state);
+        }
+
+        bool validated = graph.read_validate(test_node, seq_opt.value());
+        CATCH_REQUIRE(!validated);
+    }
+
+    CATCH_SECTION("PlainAccess always allows reads and always validates") {
+        PlainGraph graph(n_nodes, max_degree);
+        std::vector<Idx> initial_state = {0, 1, 2, 3, 4};
+        std::vector<Idx> modified_state = {5, 6, 7, 8, 9};
+        graph.replace_node(test_node, initial_state);
+
+        auto guard = graph.write_guard(test_node);
+        auto seq_opt = graph.read_begin(test_node);
+        CATCH_REQUIRE(seq_opt.has_value());
+
+        graph.replace_node(test_node, modified_state);
+
+        bool validated = graph.read_validate(test_node, seq_opt.value());
+        CATCH_REQUIRE(validated);
+    }
 }
