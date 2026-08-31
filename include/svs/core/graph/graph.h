@@ -20,10 +20,17 @@
 #include "svs/core/data/simple.h"
 #include "svs/lib/algorithms.h"
 #include "svs/lib/boundscheck.h"
+#include "svs/lib/concurrency/atomic_span.h"
+#include "svs/lib/concurrency/seqlock.h"
+#include "svs/lib/relocatable_spinlock.h"
 #include "svs/lib/saveload.h"
+#include "svs/lib/segmented_vector.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <type_traits>
 
@@ -32,10 +39,38 @@ namespace svs::graphs {
 enum class AddEdgeResult : uint8_t { Added, AlreadyExists, Full };
 
 struct PlainAccess {
+    struct state_type {
+        void resize(size_t /*n*/) {}
+    };
+
     template <typename T> static T load(const T& value) { return value; }
     template <typename T> static void store(T& destination, T value) {
         destination = value;
     }
+
+    template <typename Idx> using span_type = std::span<const Idx>;
+};
+
+struct SeqlockAccess {
+    struct state_type {
+        SeqLockArray seq_counters;
+        lib::SegmentedVector<RelocatableSpinLock> node_locks;
+
+        void resize(size_t n) {
+            seq_counters.resize(n);
+            node_locks.resize(n);
+        }
+    };
+
+    template <typename T> static T load(const T& value) {
+        return std::atomic_ref<const T>(value).load(std::memory_order_relaxed);
+    }
+
+    template <typename T> static void store(T& destination, T value) {
+        std::atomic_ref<T>(destination).store(value, std::memory_order_relaxed);
+    }
+
+    template <typename Idx> using span_type = AtomicSpan<const Idx>;
 };
 
 //
@@ -66,6 +101,7 @@ template <
 class SimpleGraphBase {
   public:
     using data_type = Data;
+    using access_type = Access;
 
     /// The integer representation used to represent vertices in this graph.
     using index_type = Idx;
@@ -75,7 +111,46 @@ class SimpleGraphBase {
     /// Type used to represent mutable adjacency lists externally.
     using reference = std::span<Idx>;
     /// Type used to represent constant adjacency lists externally.
-    using const_reference = std::span<const Idx>;
+    using const_reference = typename Access::template span_type<Idx>;
+
+    class WriteGuard {
+      public:
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+        WriteGuard(WriteGuard&&) = delete;
+        WriteGuard& operator=(WriteGuard&&) = delete;
+
+        ~WriteGuard() {
+            if constexpr (std::same_as<Access, SeqlockAccess>) {
+                state_.seq_counters[node_].end_write(seq_);
+                lock_->unlock();
+            }
+        }
+
+      private:
+        friend class SimpleGraphBase;
+
+        WriteGuard(typename Access::state_type& state, Idx node)
+            : state_{state}
+            , node_{node}
+            , seq_{0}
+            , lock_{} {
+            if constexpr (std::same_as<Access, SeqlockAccess>) {
+                state_.node_locks[node_].lock();
+                lock_ = &state_.node_locks[node_];
+                seq_ = state_.seq_counters[node_].begin_write();
+            }
+        }
+
+        typename Access::state_type& state_;
+        Idx node_;
+        uint8_t seq_;
+        [[no_unique_address]] std::conditional_t<
+            std::same_as<Access, SeqlockAccess>,
+            RelocatableSpinLock*,
+            std::monostate>
+            lock_;
+    };
 
     ///
     /// @brief Construct an empty graph of the desired size.
@@ -89,6 +164,7 @@ class SimpleGraphBase {
     explicit SimpleGraphBase(size_t num_nodes, size_t max_degree)
         : data_{num_nodes, max_degree + 1}
         , max_degree_{lib::narrow<Idx>(max_degree)} {
+        access_state_.resize(num_nodes);
         reset();
     }
 
@@ -99,12 +175,15 @@ class SimpleGraphBase {
     )
         : data_{num_nodes, max_degree + 1, allocator}
         , max_degree_{lib::narrow<Idx>(max_degree)} {
+        access_state_.resize(num_nodes);
         reset();
     }
 
     explicit SimpleGraphBase(data_type data)
         : data_{std::move(data)}
-        , max_degree_{lib::narrow<Idx>(data_.dimensions() - 1)} {}
+        , max_degree_{lib::narrow<Idx>(data_.dimensions() - 1)} {
+        access_state_.resize(data_.size());
+    }
 
     const_reference raw_row(Idx i) const { return data_.get_datum(i); }
 
@@ -118,13 +197,59 @@ class SimpleGraphBase {
         std::span<const Idx> raw_data = data_.get_datum(i);
         auto num_neighbors = Access::load(raw_data.front());
 
+        // Clamp to max_degree to prevent torn reads observing uninitialised memory.
+        num_neighbors = std::min(num_neighbors, max_degree_);
+
         // Maybe prefetch the rest of the adjacncy list.
         size_t bytes = (1 + num_neighbors) * sizeof(Idx);
         if (bytes > lib::CACHELINE_BYTES) {
             lib::prefetch(std::as_bytes(raw_data).subspan(lib::CACHELINE_BYTES));
         }
-        return raw_data.subspan(1, num_neighbors);
+
+        if constexpr (std::same_as<Access, SeqlockAccess>) {
+            return const_reference{raw_data.data() + 1, num_neighbors};
+        } else {
+            return raw_data.subspan(1, num_neighbors);
+        }
     }
+
+    ///
+    /// @brief Begin a seqlock read on node ``i``.
+    ///
+    /// For PlainAccess, always returns a valid token. For SeqlockAccess, returns the
+    /// current sequence counter value if no write is in progress, or std::nullopt if a
+    /// write is ongoing.
+    ///
+    std::optional<uint8_t> read_begin(Idx i) const {
+        if constexpr (std::same_as<Access, SeqlockAccess>) {
+            return access_state_.seq_counters[i].read_begin();
+        } else {
+            return uint8_t{0};
+        }
+    }
+
+    ///
+    /// @brief Validate a seqlock read on node ``i``.
+    ///
+    /// Returns true if no concurrent write occurred during the read. For PlainAccess,
+    /// always returns true.
+    ///
+    bool read_validate(Idx i, uint8_t seq) const {
+        if constexpr (std::same_as<Access, SeqlockAccess>) {
+            return access_state_.seq_counters[i].read_validate(seq);
+        } else {
+            return true;
+        }
+    }
+
+    ///
+    /// @brief Acquire a write guard for node ``i``.
+    ///
+    /// For SeqlockAccess, takes the per-node spinlock and increments the seqlock counter
+    /// to signal an ongoing write. On destruction, the guard increments the counter again
+    /// to signal completion. For PlainAccess, compiles to a no-op guard.
+    ///
+    WriteGuard write_guard(Idx i) { return WriteGuard{access_state_, i}; }
 
     ///
     /// @brief Return whether or not the adjacency list has an edge from ``src`` to ``dst``.
@@ -205,6 +330,8 @@ class SimpleGraphBase {
         for (size_t j = 0; j < elements_to_copy; ++j) {
             Access::store(adjacency_list[j], adjusted_neighbors[j]);
         }
+        // Store the new size AFTER storing all entries to prevent torn reads.
+        // A reader clamping size to max_degree_ ensures it never reads uninitialised data.
         Access::store(raw_data.front(), elements_to_copy);
     }
 
@@ -301,7 +428,10 @@ class SimpleGraphBase {
     data_type& get_data() { return data_; }
 
     // Resizeable API
-    void unsafe_resize(size_t new_size) { data_.resize(new_size); }
+    void unsafe_resize(size_t new_size) {
+        data_.resize(new_size);
+        access_state_.resize(new_size);
+    }
     void add_node() { unsafe_resize(n_nodes() + 1); }
 
     ///// Saving
@@ -401,6 +531,7 @@ class SimpleGraphBase {
   protected:
     data_type data_;
     Idx max_degree_;
+    [[no_unique_address]] typename Access::state_type access_state_;
 };
 
 /////
