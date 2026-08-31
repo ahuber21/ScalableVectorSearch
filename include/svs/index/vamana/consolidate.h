@@ -31,6 +31,7 @@
 #include "tsl/robin_set.h"
 
 // stdlib
+#include <ranges>
 #include <span>
 #include <unordered_set>
 
@@ -189,17 +190,27 @@ class GraphConsolidator {
     /// @param neighbors The current neighbors of the vertex being processed.
     /// @param is_deleted Callable functor returning `true` of a vertex is deleted.
     ///
-    template <typename Deleted>
+    /// Accepts any container providing single-pass forward iteration.
+    ///
+    template <typename Neighbors, typename Deleted>
     void populate_candidates(
-        set_type& all_candidates,
-        const graph_neighbor_container& neighbors,
-        const Deleted& is_deleted
+        set_type& all_candidates, const Neighbors& neighbors, const Deleted& is_deleted
     ) const {
         all_candidates.clear();
         for (auto dst : neighbors) {
             if (is_deleted(dst)) {
                 const auto& others = graph_.get_node(dst);
-                all_candidates.insert(others.begin(), others.end());
+                if constexpr (std::ranges::random_access_range<
+                                  std::remove_cvref_t<decltype(others)>>) {
+                    all_candidates.insert(others.begin(), others.end());
+                } else {
+                    // Reserve then insert element-wise. The reserve stabilizes iteration
+                    // order which determines which edge consolidation prunes.
+                    all_candidates.reserve(all_candidates.size() + others.size());
+                    for (auto n : others) {
+                        all_candidates.insert(n);
+                    }
+                }
             } else {
                 all_candidates.insert(dst);
             }
