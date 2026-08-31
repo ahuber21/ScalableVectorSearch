@@ -135,6 +135,15 @@ class MutableVamanaIndex {
     template <typename, typename> friend class BatchIterator;
 
   public:
+    // When the policy demands SegmentStable, the dataset must provide it or lock-free
+    // searchers dereference freed memory when the dataset reallocates.
+    static_assert(
+        !std::is_same_v<typename Sync::growth_type, data::SegmentStable> ||
+            data::is_dataset_grow_stable_v<Data>,
+        "SeqlockSync requires a dataset with address-stable growth (Blocked<Alloc, "
+        "SegmentStable>)"
+    );
+
     // Traits
     static constexpr bool supports_insertions = true;
     static constexpr bool supports_deletions = true;

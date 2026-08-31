@@ -727,8 +727,8 @@ inline constexpr bool is_grow_stable_v<Blocked<Alloc, SegmentStable>> = true;
 // Address-stable dataset: growth does not invalidate element pointers.
 template <typename T> inline constexpr bool is_dataset_grow_stable_v = false;
 template <typename T, size_t Extent, typename Alloc>
-inline constexpr bool
-    is_dataset_grow_stable_v<SimpleData<T, Extent, Blocked<Alloc, SegmentStable>>> = true;
+inline constexpr bool is_dataset_grow_stable_v<SimpleData<T, Extent, Alloc>> =
+    is_grow_stable_v<Alloc>;
 
 } // namespace data
 
