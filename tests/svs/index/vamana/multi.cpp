@@ -599,7 +599,9 @@ CATCH_TEST_CASE(
         build_parameters, std::move(base_data), labels, Distance{}, 4
     );
 
-    const auto search_parameters = svs::index::vamana::VamanaSearchParameters();
+    auto search_parameters = index->get_search_parameters();
+    search_parameters.buffer_config({100});
+    index->set_search_parameters(search_parameters);
 
     // Counters for results - atomics because Catch2 macros are not thread-safe.
     std::atomic<size_t> search_successes{0};
