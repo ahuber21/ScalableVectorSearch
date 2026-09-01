@@ -780,6 +780,18 @@ class MultiMutableVamanaIndex {
     }
 };
 
+// Peak RSS excludes SVS hugepage allocations, so per-instance regressions are invisible
+// to runtime measurement. The [[no_unique_address]] mutexes are empty under
+// SequentialSync (asserted in sync_policy.h), but pending_deletes_ adds 56 bytes vs
+// main (136 bytes). Pin current size to prevent further growth.
+static_assert(
+    sizeof(MultiMutableVamanaIndex<
+           graphs::SimpleBlockedGraph<uint32_t>,
+           data::SimpleData<float>,
+           distance::DistanceL2,
+           SequentialSync>) == 200 // main: 136 bytes, regression: +64 bytes
+);
+
 ///// Deduction Guides.
 // Guide for building.
 template <typename Data, typename Dist, typename ExternalIds>

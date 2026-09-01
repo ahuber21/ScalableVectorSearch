@@ -186,8 +186,12 @@ static_assert(std::is_move_assignable_v<SequentialSync::mutex_type>);
 static_assert(std::is_move_constructible_v<SeqlockSync::mutex_type>);
 static_assert(std::is_move_assignable_v<SeqlockSync::mutex_type>);
 
-// The sequential policy's mutex must remain empty for zero overhead.
+// Peak RSS excludes SVS hugepage allocations, so per-element regressions smaller than
+// 1 GiB are invisible to runtime measurement. The sequential policy must remain
+// byte-identical to the unparameterized index to prevent silent memory growth.
 static_assert(std::is_empty_v<SequentialSync::mutex_type>);
+static_assert(sizeof(PlainCounter) == sizeof(size_t));
+static_assert(sizeof(SequentialSync::container_type<int>::value_type) == sizeof(int));
 
 // A mutex must not be silently copyable.
 static_assert(!std::is_copy_constructible_v<SeqlockSync::mutex_type>);
