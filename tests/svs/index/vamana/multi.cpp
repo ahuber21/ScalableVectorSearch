@@ -454,3 +454,193 @@ CATCH_TEST_CASE(
         }
     }
 }
+
+// AR-10 Tests: Sync policy integration for MultiMutableVamanaIndex
+
+CATCH_TEST_CASE("Multi: Sync policy compile-time routing", "[index][vamana][multi][sync]") {
+    // Force instantiation and verify that SeqlockSync is threaded into the parent.
+    using Distance = svs::DistanceL2;
+    using Eltype = float;
+    using Data = svs::data::SimpleData<Eltype>;
+    using GraphAlloc =
+        svs::data::Blocked<svs::lib::Allocator<uint32_t>, svs::data::SegmentStable>;
+    using GraphData = svs::data::SimpleData<uint32_t, svs::Dynamic, GraphAlloc>;
+    using Graph =
+        svs::graphs::SimpleGraphBase<uint32_t, GraphData, svs::graphs::SeqlockAccess>;
+
+    using MultiSeqlock = svs::index::vamana::
+        MultiMutableVamanaIndex<Graph, Data, Distance, svs::index::vamana::SeqlockSync>;
+
+    // Force complete instantiation - a type alias proves nothing.
+    [[maybe_unused]] auto size = sizeof(MultiSeqlock);
+    CATCH_REQUIRE(size > 0);
+
+    // Verify the parent index is instantiated with SeqlockSync.
+    using ParentType = typename MultiSeqlock::ParentIndex;
+    static_assert(
+        std::is_same_v<
+            ParentType,
+            svs::index::vamana::
+                MutableVamanaIndex<Graph, Data, Distance, svs::index::vamana::SeqlockSync>>,
+        "Parent index must be instantiated with SeqlockSync"
+    );
+}
+
+CATCH_TEST_CASE(
+    "Multi: Behavior preservation with default policy", "[index][vamana][multi][sync]"
+) {
+    // Verify that three-argument instantiation still compiles and behaves identically.
+    using Distance = svs::DistanceL2;
+    using Eltype = float;
+    const size_t N = 128;
+    const size_t max_degree = 32;
+    const float alpha = 1.2f;
+    const size_t num_threads = 2;
+
+    const auto data = svs::data::SimpleData<Eltype, N>::load(test_dataset::data_svs_file());
+    const size_t num_points = std::min<size_t>(data.size(), 100);
+
+    std::vector<size_t> labels(num_points);
+    std::iota(labels.begin(), labels.end(), 0);
+
+    const svs::index::vamana::VamanaBuildParameters build_parameters{
+        alpha, max_degree, 2 * max_degree, 500, max_degree - 4, true};
+
+    // Three-argument instantiation must still compile and deduce SequentialSync.
+    auto index = svs::index::vamana::MultiMutableVamanaIndex(
+        build_parameters, data, labels, Distance(), num_threads
+    );
+
+    CATCH_REQUIRE(index.size() == num_points);
+    CATCH_REQUIRE(index.labelcount() == num_points);
+
+    // Verify the deduced type is sequential by checking that the parent uses NullMutex.
+    using IndexType = decltype(index);
+    using ParentType = typename IndexType::ParentIndex;
+    static_assert(
+        std::is_same_v<typename ParentType::Sync::mutex_type, svs::lib::NullMutex>,
+        "Default instantiation must use SequentialSync with NullMutex"
+    );
+}
+
+CATCH_TEST_CASE(
+    "Multi: Concurrent add and search under SeqlockSync",
+    "[index][vamana][multi][sync][concurrent]"
+) {
+    // Test concurrent add and search operations on a multi-value index with SeqlockSync.
+    // This test is skipped for now because it depends on visitor work happening in parallel
+    // on another branch (AR-11). Once that work is integrated, remove this skip.
+    CATCH_SKIP("Depends on SeqlockVisitor routing (AR-11)");
+
+    using Distance = svs::distance::DistanceL2;
+    using Eltype = float;
+
+#if defined(__SANITIZE_THREAD__) || defined(SVS_THREAD_SANITIZER)
+    const size_t kPoints = 500;
+    const size_t kDim = 16;
+    const size_t kMaxDegree = 16;
+    const size_t kNumQueries = 10;
+    const size_t kAddBatch = 100;
+#else
+    const size_t kPoints = 2000;
+    const size_t kDim = 32;
+    const size_t kMaxDegree = 32;
+    const size_t kNumQueries = 50;
+    const size_t kAddBatch = 500;
+#endif
+
+    using ConcurrentGraphAlloc =
+        svs::data::Blocked<svs::lib::Allocator<uint32_t>, svs::data::SegmentStable>;
+    using ConcurrentGraphData =
+        svs::data::SimpleData<uint32_t, svs::Dynamic, ConcurrentGraphAlloc>;
+    using ConcurrentGraph = svs::graphs::
+        SimpleGraphBase<uint32_t, ConcurrentGraphData, svs::graphs::SeqlockAccess>;
+    using ConcurrentDataAlloc =
+        svs::data::Blocked<svs::lib::Allocator<Eltype>, svs::data::SegmentStable>;
+    using ConcurrentData = svs::data::SimpleData<Eltype, svs::Dynamic, ConcurrentDataAlloc>;
+
+    using MultiConcurrent = svs::index::vamana::MultiMutableVamanaIndex<
+        ConcurrentGraph,
+        ConcurrentData,
+        Distance,
+        svs::index::vamana::SeqlockSync>;
+
+    // Generate random vectors.
+    std::mt19937 rng{42};
+    std::normal_distribution<Eltype> dist{0.0f, 1.0f};
+    auto make_vectors = [&](size_t n) {
+        std::vector<Eltype> v(n * kDim);
+        for (auto& x : v) {
+            x = dist(rng);
+        }
+        return v;
+    };
+
+    auto base_raw = make_vectors(kPoints);
+    auto add_raw = make_vectors(kAddBatch);
+    auto query_raw = make_vectors(kNumQueries);
+
+    // Build initial index.
+    auto base_alloc = ConcurrentDataAlloc{};
+    auto base_data = ConcurrentData(kPoints, kDim, base_alloc);
+    for (size_t i = 0; i < kPoints; ++i) {
+        base_data.set_datum(i, std::span<const Eltype>(base_raw.data() + i * kDim, kDim));
+    }
+
+    std::vector<size_t> labels(kPoints);
+    std::iota(labels.begin(), labels.end(), 0);
+
+    const svs::index::vamana::VamanaBuildParameters build_parameters{
+        1.2f, kMaxDegree, 2 * kMaxDegree, 500, kMaxDegree, true};
+
+    auto index = std::make_unique<MultiConcurrent>(
+        build_parameters, std::move(base_data), labels, Distance{}, 4
+    );
+
+    const auto search_parameters = svs::index::vamana::VamanaSearchParameters();
+
+    // Counters for results - atomics because Catch2 macros are not thread-safe.
+    std::atomic<size_t> search_successes{0};
+    std::atomic<size_t> search_attempts{0};
+    std::atomic<size_t> add_successes{0};
+
+    // Prepare addition batch.
+    auto add_data = svs::data::SimpleData<Eltype>(kAddBatch, kDim);
+    for (size_t i = 0; i < kAddBatch; ++i) {
+        add_data.set_datum(i, std::span<const Eltype>(add_raw.data() + i * kDim, kDim));
+    }
+    std::vector<size_t> add_labels(kAddBatch);
+    std::iota(add_labels.begin(), add_labels.end(), kPoints);
+
+    // Launch concurrent operations.
+    auto search_worker = std::thread([&]() {
+        auto scratch = index->scratchspace(search_parameters);
+        for (size_t i = 0; i < kNumQueries; ++i) {
+            try {
+                auto query = std::span<const Eltype>(query_raw.data() + i * kDim, kDim);
+                index->search(query, scratch);
+                ++search_successes;
+            } catch (...) {
+                // Exceptions are allowed during concurrent mutation.
+            }
+            ++search_attempts;
+        }
+    });
+
+    auto add_worker = std::thread([&]() {
+        try {
+            index->add_points(add_data, add_labels);
+            ++add_successes;
+        } catch (...) {
+            // Exceptions allowed.
+        }
+    });
+
+    search_worker.join();
+    add_worker.join();
+
+    // Verify operations completed.
+    CATCH_REQUIRE(search_attempts == kNumQueries);
+    CATCH_REQUIRE(search_successes > 0);
+    CATCH_REQUIRE(add_successes == 1);
+}
