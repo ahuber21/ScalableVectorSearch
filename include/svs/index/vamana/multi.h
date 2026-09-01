@@ -34,6 +34,9 @@ struct L2ETag {};
 struct E2LTag {};
 
 /// Mutex wrapper with tag type to enable distinct empty base optimization.
+/// Making l2e_mutex_ and e2l_mutex_ the same type silently collapses them to one object,
+/// breaking every caller relying on separate locks and introducing race-condition
+/// deadlocks.
 template <typename M, typename Tag> struct TaggedMutex : M {};
 } // namespace detail
 
