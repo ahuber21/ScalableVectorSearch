@@ -612,9 +612,199 @@ CATCH_TEST_CASE("Size After Delete Semantics", "[index][vamana][sync_policy]") {
         index.compact();
         size_t size_after_consolidate = index.size();
 
-        // size() continues reporting deleted entries; contradicts documented behavior.
-        CATCH_REQUIRE(size_after_delete == num_points);
-        // size() continues reporting deleted entries; contradicts documented behavior.
-        CATCH_REQUIRE(size_after_consolidate == num_points);
+        // Both policies now purge the translator immediately in delete_entries.
+        CATCH_REQUIRE(size_after_delete == num_points - num_to_delete);
+        CATCH_REQUIRE(size_after_consolidate == num_points - num_to_delete);
+    }
+}
+
+CATCH_TEST_CASE("Policies Agree on Size", "[index][vamana][sync_policy]") {
+    constexpr size_t initial_points = 20;
+    constexpr size_t points_to_add = 5;
+    constexpr size_t dimensions = 4;
+
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+
+    auto make_dataset = [](size_t n) {
+        auto data = svs::data::SimpleData<float, svs::Dynamic>(n, dimensions);
+        std::vector<float> datum(dimensions);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t d = 0; d < dimensions; ++d) {
+                datum[d] = static_cast<float>(i * dimensions + d + 1);
+            }
+            data.set_datum(i, datum);
+        }
+        return data;
+    };
+
+    auto make_grow_stable_dataset = [](size_t n) {
+        using GrowStableAlloc =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+        using GrowStableData = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+        GrowStableData data(n, dimensions);
+        std::vector<float> datum(dimensions);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t d = 0; d < dimensions; ++d) {
+                datum[d] = static_cast<float>(i * dimensions + d + 1);
+            }
+            data.set_datum(i, datum);
+        }
+        return data;
+    };
+
+    auto build_params =
+        svs::index::vamana::VamanaBuildParameters{1.2, 16, 10, 20, 10, true};
+
+    CATCH_SECTION("Both policies agree on size after delete") {
+        using SeqGraph = svs::graphs::SimpleGraph<Idx>;
+        using SeqData = svs::data::SimpleData<float, svs::Dynamic>;
+        using SeqIndex =
+            vamana::MutableVamanaIndex<SeqGraph, SeqData, Distance, vamana::SequentialSync>;
+
+        using LockGraph = svs::graphs::SimpleGraphBase<
+            Idx,
+            svs::data::SimpleData<Idx, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+        using GrowStableAlloc =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+        using LockData = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+        using LockIndex =
+            vamana::MutableVamanaIndex<LockGraph, LockData, Distance, vamana::SeqlockSync>;
+
+        std::vector<size_t> external_ids(initial_points);
+        std::iota(external_ids.begin(), external_ids.end(), 0);
+
+        auto seq_index = SeqIndex(
+            build_params, make_dataset(initial_points), external_ids, Distance(), size_t{1}
+        );
+        auto lock_index = LockIndex(
+            build_params,
+            make_grow_stable_dataset(initial_points),
+            external_ids,
+            Distance(),
+            size_t{1}
+        );
+
+        CATCH_REQUIRE(seq_index.size() == initial_points);
+        CATCH_REQUIRE(lock_index.size() == initial_points);
+
+        std::vector<size_t> to_delete = {3, 7, 11};
+        seq_index.delete_entries(to_delete);
+        lock_index.delete_entries(to_delete);
+
+        CATCH_REQUIRE(seq_index.size() == lock_index.size());
+        CATCH_REQUIRE(seq_index.size() == initial_points - to_delete.size());
+    }
+
+    CATCH_SECTION("Both policies agree on size after interleaved delete and insert") {
+        using SeqGraph = svs::graphs::SimpleGraph<Idx>;
+        using SeqData = svs::data::SimpleData<float, svs::Dynamic>;
+        using SeqIndex =
+            vamana::MutableVamanaIndex<SeqGraph, SeqData, Distance, vamana::SequentialSync>;
+
+        using LockGraph = svs::graphs::SimpleGraphBase<
+            Idx,
+            svs::data::SimpleData<Idx, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+        using GrowStableAlloc =
+            svs::data::Blocked<svs::lib::Allocator<float>, svs::data::SegmentStable>;
+        using LockData = svs::data::SimpleData<float, svs::Dynamic, GrowStableAlloc>;
+        using LockIndex =
+            vamana::MutableVamanaIndex<LockGraph, LockData, Distance, vamana::SeqlockSync>;
+
+        std::vector<size_t> external_ids(initial_points);
+        std::iota(external_ids.begin(), external_ids.end(), 0);
+
+        auto seq_index = SeqIndex(
+            build_params, make_dataset(initial_points), external_ids, Distance(), size_t{1}
+        );
+        auto lock_index = LockIndex(
+            build_params,
+            make_grow_stable_dataset(initial_points),
+            external_ids,
+            Distance(),
+            size_t{1}
+        );
+
+        std::vector<size_t> to_delete = {2, 5};
+        seq_index.delete_entries(to_delete);
+        lock_index.delete_entries(to_delete);
+
+        CATCH_REQUIRE(seq_index.size() == lock_index.size());
+
+        auto new_data_seq = make_dataset(points_to_add);
+        auto new_data_lock = make_grow_stable_dataset(points_to_add);
+        std::vector<size_t> new_ids = {100, 101, 102, 103, 104};
+
+        seq_index.add_points(new_data_seq, new_ids);
+        lock_index.add_points(new_data_lock, new_ids);
+
+        CATCH_REQUIRE(seq_index.size() == lock_index.size());
+        CATCH_REQUIRE(
+            seq_index.size() == initial_points - to_delete.size() + points_to_add
+        );
+    }
+}
+
+CATCH_TEST_CASE("Translator Invariants", "[index][vamana][sync_policy]") {
+    constexpr size_t initial_points = 15;
+    constexpr size_t dimensions = 4;
+
+    using Idx = uint32_t;
+    using Distance = svs::distance::DistanceL2;
+    using Graph = svs::graphs::SimpleGraph<Idx>;
+    using Data = svs::data::SimpleData<float, svs::Dynamic>;
+    using Index = vamana::MutableVamanaIndex<Graph, Data, Distance, vamana::SequentialSync>;
+
+    auto make_dataset = [](size_t n) {
+        auto data = svs::data::SimpleData<float, svs::Dynamic>(n, dimensions);
+        std::vector<float> datum(dimensions);
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t d = 0; d < dimensions; ++d) {
+                datum[d] = static_cast<float>(i * dimensions + d + 1);
+            }
+            data.set_datum(i, datum);
+        }
+        return data;
+    };
+
+    auto build_params =
+        svs::index::vamana::VamanaBuildParameters{1.2, 16, 10, 20, 10, true};
+
+    CATCH_SECTION("Translator maps remain mutual inverses after delete-consolidate-insert"
+    ) {
+        std::vector<size_t> external_ids(initial_points);
+        std::iota(external_ids.begin(), external_ids.end(), 100);
+
+        auto index = Index(
+            build_params, make_dataset(initial_points), external_ids, Distance(), size_t{1}
+        );
+
+        auto check_inverses = [&index]() {
+            auto all_external = index.external_ids();
+            for (auto ext_id : all_external) {
+                CATCH_REQUIRE(index.has_id(ext_id));
+                auto int_id = index.translate_external_id(ext_id);
+                auto recovered = index.translate_internal_id(int_id);
+                CATCH_REQUIRE(recovered == ext_id);
+            }
+        };
+
+        check_inverses();
+
+        std::vector<size_t> to_delete = {102, 105, 110};
+        index.delete_entries(to_delete);
+        check_inverses();
+
+        index.consolidate();
+        check_inverses();
+
+        auto new_data = make_dataset(3);
+        std::vector<size_t> new_ids = {200, 201, 202};
+        index.add_points(new_data, new_ids);
+        check_inverses();
+
+        CATCH_REQUIRE(index.size() == initial_points - to_delete.size() + new_ids.size());
     }
 }
