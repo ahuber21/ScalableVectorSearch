@@ -191,4 +191,69 @@ CATCH_TEST_CASE("Graph Consolidation", "[graph_index]") {
         check_post_conditions(plain_graph, predicate);
         check_post_conditions(seqlock_graph, predicate);
     }
+
+    CATCH_SECTION("Consolidation bumps seqlock counters") {
+        using SeqlockGraph = svs::graphs::SimpleGraphBase<
+            uint32_t,
+            svs::data::SimpleData<uint32_t, svs::Dynamic>,
+            svs::graphs::SeqlockAccess>;
+
+        auto plain_graph = test_dataset::graph();
+        SeqlockGraph seqlock_graph(plain_graph.n_nodes(), plain_graph.max_degree());
+
+        for (size_t i = 0; i < plain_graph.n_nodes(); ++i) {
+            const auto& neighbors = plain_graph.get_node(i);
+            std::vector<uint32_t> neighbor_vec(neighbors.begin(), neighbors.end());
+            seqlock_graph.replace_node(i, neighbor_vec);
+        }
+
+        auto predicate = [](const auto& i) { return (i % 10) == 0; };
+
+        // First, identify nodes that will be modified by consolidation.
+        std::vector<size_t> nodes_to_be_updated;
+        for (size_t i = 0; i < seqlock_graph.n_nodes(); ++i) {
+            if (predicate(i)) {
+                continue;
+            }
+            const auto& neighbors = seqlock_graph.get_node(i);
+            if (!std::none_of(neighbors.begin(), neighbors.end(), predicate)) {
+                nodes_to_be_updated.push_back(i);
+            }
+        }
+        CATCH_REQUIRE(!nodes_to_be_updated.empty());
+
+        // Capture sequence counters before consolidation.
+        std::unordered_map<size_t, svs::SeqLockCounter::counter_type> seq_before;
+        for (auto node : nodes_to_be_updated) {
+            auto seq = seqlock_graph.read_begin(node);
+            CATCH_REQUIRE(seq.has_value());
+            seq_before[node] = seq.value();
+        }
+
+        svs::distance::DistanceL2 distance{};
+        auto single_thread = svs::threads::DefaultThreadPool(1);
+        svs::index::vamana::consolidate(
+            seqlock_graph,
+            data,
+            single_thread,
+            seqlock_graph.max_degree(),
+            750,
+            1.2,
+            distance,
+            predicate
+        );
+
+        // Without write_guard: counters stay unchanged, read_validate succeeds.
+        // With write_guard: counters advance, read_validate fails.
+        for (auto node : nodes_to_be_updated) {
+            bool still_valid = seqlock_graph.read_validate(node, seq_before.at(node));
+            CATCH_INFO("Node " << node << " counter should have changed");
+            CATCH_REQUIRE(!still_valid);
+
+            // Verify counter is in readable (even) state.
+            auto seq_after = seqlock_graph.read_begin(node);
+            CATCH_INFO("Node " << node << " counter stuck in write state");
+            CATCH_REQUIRE(seq_after.has_value());
+        }
+    }
 }

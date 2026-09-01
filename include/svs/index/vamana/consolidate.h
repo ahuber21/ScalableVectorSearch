@@ -313,7 +313,10 @@ class GraphConsolidator {
     ) {
         for (auto i : local_ids) {
             if (update_buffer.needs_update(i)) {
-                graph_.replace_node(global_ids[offset + i], update_buffer.get_update(i));
+                I node_id = global_ids[offset + i];
+                // Guard bumps the seqlock counter so read_validate detects this write.
+                auto guard = graph_.write_guard(node_id);
+                graph_.replace_node(node_id, update_buffer.get_update(i));
             }
         }
     }
