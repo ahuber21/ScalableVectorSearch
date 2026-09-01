@@ -154,6 +154,7 @@ set(TEST_SOURCES
     # Concurrent (SeqlockSync policy) Vamana index.
     ${TEST_DIR}/svs/concurrent/concurrency.cpp
     ${TEST_DIR}/svs/concurrent/downstream.cpp
+    ${TEST_DIR}/svs/concurrent/hazards.cpp
     # Inverted
     ${TEST_DIR}/svs/index/inverted/clustering.cpp
     ${TEST_DIR}/svs/index/inverted/memory_based.cpp
