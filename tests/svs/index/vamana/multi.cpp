@@ -534,11 +534,6 @@ CATCH_TEST_CASE(
     "Multi: Concurrent add and search under SeqlockSync",
     "[index][vamana][multi][sync][concurrent]"
 ) {
-    // Test concurrent add and search operations on a multi-value index with SeqlockSync.
-    // This test is skipped for now because it depends on visitor work happening in parallel
-    // on another branch (AR-11). Once that work is integrated, remove this skip.
-    CATCH_SKIP("Depends on SeqlockVisitor routing (AR-11)");
-
     using Distance = svs::distance::DistanceL2;
     using Eltype = float;
 
@@ -604,7 +599,9 @@ CATCH_TEST_CASE(
         build_parameters, std::move(base_data), labels, Distance{}, 4
     );
 
-    const auto search_parameters = svs::index::vamana::VamanaSearchParameters();
+    auto search_parameters = index->get_search_parameters();
+    search_parameters.buffer_config({100});
+    index->set_search_parameters(search_parameters);
 
     // Counters for results - atomics because Catch2 macros are not thread-safe.
     std::atomic<size_t> search_successes{0};
