@@ -115,8 +115,7 @@ concept SyncCounter =
 /// @brief Bundle of the synchronization seams used by the mutable Vamana index.
 ///
 /// A policy supplies the mutex, counter, graph access and growth types the index composes,
-/// a graph-parameterized visitor alias, and flags selecting the slot-lifetime and
-/// search buffer protocols.
+/// a graph-parameterized visitor alias, and a flag selecting the slot-lifetime protocol.
 template <typename P>
 concept SyncPolicy = requires {
                          typename P::mutex_type;
@@ -126,7 +125,6 @@ concept SyncPolicy = requires {
                          typename P::template container_type<int>;
                          requires SyncCounter<typename P::counter_type>;
                          { P::reserves_pending_slots } -> std::convertible_to<bool>;
-                         { P::supplements_search_buffer } -> std::convertible_to<bool>;
                      };
 
 /// @brief A synchronization policy together with the graph type it will be used with.
@@ -148,8 +146,6 @@ struct SequentialSync {
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
     static constexpr bool reserves_pending_slots = false;
-    /// Search results never need topping up from the translator.
-    static constexpr bool supplements_search_buffer = false;
 };
 
 /// @brief Synchronization policy for concurrent readers with seqlock-protected adjacency.
@@ -168,7 +164,6 @@ struct SeqlockSync {
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
-    static constexpr bool supplements_search_buffer = true;
 };
 
 static_assert(SyncCounter<PlainCounter>);
