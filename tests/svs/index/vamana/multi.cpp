@@ -534,11 +534,6 @@ CATCH_TEST_CASE(
     "Multi: Concurrent add and search under SeqlockSync",
     "[index][vamana][multi][sync][concurrent]"
 ) {
-    // Test concurrent add and search operations on a multi-value index with SeqlockSync.
-    // This test is skipped for now because it depends on visitor work happening in parallel
-    // on another branch (AR-11). Once that work is integrated, remove this skip.
-    CATCH_SKIP("Depends on SeqlockVisitor routing (AR-11)");
-
     using Distance = svs::distance::DistanceL2;
     using Eltype = float;
 
