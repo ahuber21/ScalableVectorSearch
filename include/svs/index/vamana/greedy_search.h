@@ -130,10 +130,10 @@ struct SeqlockVisitor {
     void operator()(const Graph& graph, size_t node_id, F&& body) const {
         using Idx = typename Graph::index_type;
 
-        // Thread-local scratch storage for the adjacency list copy.
+        // Thread-local rather than a member: the visitor must stay stateless so that one
+        // instance can serve every search thread.
         thread_local std::vector<Idx> scratch;
 
-        // Ensure scratch is large enough for this graph's max degree.
         if (scratch.size() < graph.max_degree()) {
             scratch.resize(graph.max_degree());
         }
@@ -148,24 +148,25 @@ struct SeqlockVisitor {
                 continue;
             }
 
-            // Copy the adjacency list into scratch.
             auto neighbors = graph.get_node(id);
             const size_t n = neighbors.size();
             std::copy(neighbors.begin(), neighbors.end(), scratch.begin());
 
-            // Validate the read before publishing anything.
+            // Validation must precede the body. Publishing first cannot be retracted: an
+            // unwritten slot inside the allocation reaches the search buffer as a live id.
             if (!graph.read_validate(id, seq_opt.value())) {
                 budget.on_failure(node_id);
                 continue;
             }
 
-            // Validation succeeded. Call the body once with the validated copy.
             body(std::span<const Idx>{scratch.data(), n});
             return;
         }
     }
 
   private:
+    // Counting yielded rounds, not attempts: an attempt bound measures CPU speed and an
+    // unyielding spin starves the writer, so either turns a busy writer into a throw.
     struct RetryBudget {
         size_t attempts = 0;
         size_t yielded = 0;
