@@ -116,7 +116,7 @@ concept SyncCounter =
 ///
 /// A policy supplies the mutex, counter, graph access and growth types the index composes,
 /// a graph-parameterized visitor alias, and flags selecting the slot-lifetime and
-/// translator protocols.
+/// search buffer protocols.
 template <typename P>
 concept SyncPolicy = requires {
                          typename P::mutex_type;
@@ -126,7 +126,6 @@ concept SyncPolicy = requires {
                          typename P::template container_type<int>;
                          requires SyncCounter<typename P::counter_type>;
                          { P::reserves_pending_slots } -> std::convertible_to<bool>;
-                         { P::defers_translator_cleanup } -> std::convertible_to<bool>;
                          { P::supplements_search_buffer } -> std::convertible_to<bool>;
                      };
 
@@ -149,8 +148,6 @@ struct SequentialSync {
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
     static constexpr bool reserves_pending_slots = false;
-    /// Translator entries are erased by `delete_entries` rather than by `consolidate`.
-    static constexpr bool defers_translator_cleanup = false;
     /// Search results never need topping up from the translator.
     static constexpr bool supplements_search_buffer = false;
 };
@@ -171,7 +168,6 @@ struct SeqlockSync {
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
-    static constexpr bool defers_translator_cleanup = true;
     static constexpr bool supplements_search_buffer = true;
 };
 

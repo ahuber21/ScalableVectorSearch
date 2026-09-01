@@ -503,9 +503,10 @@ class MutableVamanaIndex {
     }
 
     /// @brief Return the number of **valid** (non-deleted) entries in the index.
+    ///
+    /// Translation is kept in sync with the number of valid elements: delete_entries
+    /// purges the translator immediately under both policies.
     size_t size() const {
-        // NB: Under policies with deferred translator cleanup, soft-deleted entries remain
-        // in the translator until consolidation, so this count over-reports in that case.
         std::shared_lock<typename Sync::mutex_type> lock(translator_mutex_);
         return unsafe_size();
     }
@@ -939,9 +940,7 @@ class MutableVamanaIndex {
             for (auto i : ids) {
                 delete_entry(translator_.get_internal(i));
             }
-            if constexpr (!Sync::defers_translator_cleanup) {
-                translator_.delete_external(ids);
-            }
+            translator_.delete_external(ids);
         }
         return ids.size();
     }

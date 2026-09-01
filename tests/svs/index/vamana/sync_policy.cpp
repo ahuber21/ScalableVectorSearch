@@ -55,7 +55,6 @@ static_assert(std::is_same_v<
 static_assert(vamana::SyncPolicy<vamana::SequentialSync>);
 static_assert(vamana::SyncPolicyFor<vamana::SequentialSync, TestGraph>);
 static_assert(!vamana::SequentialSync::reserves_pending_slots);
-static_assert(!vamana::SequentialSync::defers_translator_cleanup);
 static_assert(!vamana::SequentialSync::supplements_search_buffer);
 
 // The seqlock policy must yield SeqlockVisitor (no longer templated on graph).
@@ -74,7 +73,6 @@ struct MissingCounter {
     using growth_type = svs::data::Reallocating;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
-    static constexpr bool defers_translator_cleanup = false;
     static constexpr bool supplements_search_buffer = false;
 };
 static_assert(!vamana::SyncPolicy<MissingCounter>);
@@ -87,7 +85,6 @@ struct BadVisitor {
     using node_visitor_type = int;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
-    static constexpr bool defers_translator_cleanup = false;
     static constexpr bool supplements_search_buffer = false;
 };
 static_assert(vamana::SyncPolicy<BadVisitor>);
