@@ -91,9 +91,7 @@ CATCH_TEST_CASE(
     CATCH_REQUIRE(index.has_id(n + 100));
     CATCH_REQUIRE(index.size() == n + 1);
 
-    // Deletion: verify that delete_entries accepts the call. consolidate() and compact()
-    // do not compile yet: consolidate.h's populate_candidates accepts std::span but
-    // SeqlockAccess yields AtomicSpan, causing a type mismatch at line 263.
+    // Deletion: verify that delete_entries accepts the call.
     std::vector<size_t> to_delete(n / 10);
     std::iota(to_delete.begin(), to_delete.end(), 0);
     CATCH_REQUIRE(index.delete_entries(to_delete) == to_delete.size());
