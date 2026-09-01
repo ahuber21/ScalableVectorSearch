@@ -139,13 +139,12 @@ struct SeqlockVisitor {
         }
 
         Idx id = static_cast<Idx>(node_id);
-        size_t total_attempts = 0;
-        size_t yielded_rounds = 0;
+        RetryBudget budget;
 
         while (true) {
             auto seq_opt = graph.read_begin(id);
             if (!seq_opt.has_value()) {
-                handle_retry_backoff(node_id, total_attempts, yielded_rounds);
+                budget.on_failure(node_id);
                 continue;
             }
 
@@ -156,7 +155,7 @@ struct SeqlockVisitor {
 
             // Validate the read before publishing anything.
             if (!graph.read_validate(id, seq_opt.value())) {
-                handle_retry_backoff(node_id, total_attempts, yielded_rounds);
+                budget.on_failure(node_id);
                 continue;
             }
 
@@ -167,25 +166,28 @@ struct SeqlockVisitor {
     }
 
   private:
-    static constexpr size_t kSpinLimit = 32;
-    static constexpr size_t kMaxYieldedRounds = 1000;
+    struct RetryBudget {
+        size_t attempts = 0;
+        size_t yielded = 0;
 
-    // Tracks retry attempts with exponential backoff. Throws on exhaustion.
-    static void
-    handle_retry_backoff(size_t node_id, size_t& total_attempts, size_t& yielded_rounds) {
-        ++total_attempts;
-        if (total_attempts > kSpinLimit) {
-            ++yielded_rounds;
-            if (yielded_rounds >= kMaxYieldedRounds) {
-                throw lib::ANNException(
-                    "SeqlockVisitor: exceeded retry limit for node " +
-                    std::to_string(node_id) + " after " + std::to_string(total_attempts) +
-                    " attempts"
-                );
+        static constexpr size_t kSpinLimit = 32;
+        static constexpr size_t kMaxYieldedRounds = 1000;
+
+        void on_failure(size_t node_id) {
+            ++attempts;
+            if (attempts > kSpinLimit) {
+                ++yielded;
+                if (yielded >= kMaxYieldedRounds) {
+                    throw lib::ANNException(
+                        "SeqlockVisitor: exceeded retry limit for node " +
+                        std::to_string(node_id) + " after " + std::to_string(attempts) +
+                        " attempts"
+                    );
+                }
+                std::this_thread::yield();
             }
-            std::this_thread::yield();
         }
-    }
+    };
 };
 
 /// Concept for per-node visitors.
