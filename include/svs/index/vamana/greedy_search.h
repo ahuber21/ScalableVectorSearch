@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <thread>
 
 namespace svs::index::vamana {
 
@@ -122,13 +123,14 @@ struct VisitOnce {
 
 /// Visitor that wraps node expansion in a seqlock retry loop.
 /// Copies the adjacency list, validates, then invokes the body with the validated copy.
-/// On validation failure, retries from the beginning. The body is never invoked with
-/// torn data.
+/// On validation failure, retries from the beginning with backoff. The body is never
+/// invoked with torn data.
 struct SeqlockVisitor {
     template <graphs::ImmutableMemoryGraph Graph, typename F>
     void operator()(const Graph& graph, size_t node_id, F&& body) const {
         using Idx = typename Graph::index_type;
-        constexpr size_t kMaxRetries = 10'000;
+        constexpr size_t kSpinLimit = 32;
+        constexpr size_t kMaxYieldedRounds = 1000;
 
         // Thread-local scratch storage for the adjacency list copy.
         thread_local std::vector<Idx> scratch;
@@ -139,18 +141,23 @@ struct SeqlockVisitor {
         }
 
         Idx id = static_cast<Idx>(node_id);
-        size_t retry_count = 0;
+        size_t total_attempts = 0;
+        size_t yielded_rounds = 0;
 
         while (true) {
             auto seq_opt = graph.read_begin(id);
             if (!seq_opt.has_value()) {
-                ++retry_count;
-                if (retry_count >= kMaxRetries) {
-                    throw lib::ANNException(
-                        "SeqlockVisitor: exceeded retry limit for node " +
-                        std::to_string(node_id) + " after " + std::to_string(retry_count) +
-                        " attempts"
-                    );
+                ++total_attempts;
+                if (total_attempts > kSpinLimit) {
+                    ++yielded_rounds;
+                    if (yielded_rounds >= kMaxYieldedRounds) {
+                        throw lib::ANNException(
+                            "SeqlockVisitor: exceeded retry limit for node " +
+                            std::to_string(node_id) + " after " +
+                            std::to_string(total_attempts) + " attempts"
+                        );
+                    }
+                    std::this_thread::yield();
                 }
                 continue;
             }
@@ -162,13 +169,17 @@ struct SeqlockVisitor {
 
             // Validate the read before publishing anything.
             if (!graph.read_validate(id, seq_opt.value())) {
-                ++retry_count;
-                if (retry_count >= kMaxRetries) {
-                    throw lib::ANNException(
-                        "SeqlockVisitor: exceeded retry limit for node " +
-                        std::to_string(node_id) + " after " + std::to_string(retry_count) +
-                        " attempts"
-                    );
+                ++total_attempts;
+                if (total_attempts > kSpinLimit) {
+                    ++yielded_rounds;
+                    if (yielded_rounds >= kMaxYieldedRounds) {
+                        throw lib::ANNException(
+                            "SeqlockVisitor: exceeded retry limit for node " +
+                            std::to_string(node_id) + " after " +
+                            std::to_string(total_attempts) + " attempts"
+                        );
+                    }
+                    std::this_thread::yield();
                 }
                 continue;
             }
