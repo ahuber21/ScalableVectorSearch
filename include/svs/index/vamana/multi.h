@@ -186,8 +186,8 @@ class MultiMutableVamanaIndex {
     using external_to_label_type = std::unordered_map<external_id_type, label_type>;
 
   private:
-    // Counter type: plain for NullMutex, atomic wrapped in unique_ptr otherwise.
-    // The unique_ptr wrapper keeps the class movable when Mutex is a real mutex.
+    // Counter wraps atomic in unique_ptr when Sync's mutex is real, keeping the class
+    // movable.
     using counter_type = std::conditional_t<
         std::is_same_v<typename Sync::mutex_type, lib::NullMutex>,
         external_id_type,
