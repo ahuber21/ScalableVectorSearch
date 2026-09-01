@@ -391,7 +391,6 @@ CATCH_TEST_CASE(
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex consolidate during search", "[concurrent][index]"
 ) {
-    CATCH_SKIP("consolidate() doesn't compile with SeqlockSync: needs AtomicSpan overload");
     auto base = random_vectors(kInitialPoints, kDim, 8642);
     std::vector<size_t> ids(kInitialPoints);
     std::iota(ids.begin(), ids.end(), 0);
