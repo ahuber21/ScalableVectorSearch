@@ -129,8 +129,6 @@ struct SeqlockVisitor {
     template <graphs::ImmutableMemoryGraph Graph, typename F>
     void operator()(const Graph& graph, size_t node_id, F&& body) const {
         using Idx = typename Graph::index_type;
-        constexpr size_t kSpinLimit = 32;
-        constexpr size_t kMaxYieldedRounds = 1000;
 
         // Thread-local scratch storage for the adjacency list copy.
         thread_local std::vector<Idx> scratch;
@@ -147,18 +145,7 @@ struct SeqlockVisitor {
         while (true) {
             auto seq_opt = graph.read_begin(id);
             if (!seq_opt.has_value()) {
-                ++total_attempts;
-                if (total_attempts > kSpinLimit) {
-                    ++yielded_rounds;
-                    if (yielded_rounds >= kMaxYieldedRounds) {
-                        throw lib::ANNException(
-                            "SeqlockVisitor: exceeded retry limit for node " +
-                            std::to_string(node_id) + " after " +
-                            std::to_string(total_attempts) + " attempts"
-                        );
-                    }
-                    std::this_thread::yield();
-                }
+                handle_retry_backoff(node_id, total_attempts, yielded_rounds);
                 continue;
             }
 
@@ -169,24 +156,34 @@ struct SeqlockVisitor {
 
             // Validate the read before publishing anything.
             if (!graph.read_validate(id, seq_opt.value())) {
-                ++total_attempts;
-                if (total_attempts > kSpinLimit) {
-                    ++yielded_rounds;
-                    if (yielded_rounds >= kMaxYieldedRounds) {
-                        throw lib::ANNException(
-                            "SeqlockVisitor: exceeded retry limit for node " +
-                            std::to_string(node_id) + " after " +
-                            std::to_string(total_attempts) + " attempts"
-                        );
-                    }
-                    std::this_thread::yield();
-                }
+                handle_retry_backoff(node_id, total_attempts, yielded_rounds);
                 continue;
             }
 
             // Validation succeeded. Call the body once with the validated copy.
             body(std::span<const Idx>{scratch.data(), n});
             return;
+        }
+    }
+
+  private:
+    static constexpr size_t kSpinLimit = 32;
+    static constexpr size_t kMaxYieldedRounds = 1000;
+
+    // Tracks retry attempts with exponential backoff. Throws on exhaustion.
+    static void
+    handle_retry_backoff(size_t node_id, size_t& total_attempts, size_t& yielded_rounds) {
+        ++total_attempts;
+        if (total_attempts > kSpinLimit) {
+            ++yielded_rounds;
+            if (yielded_rounds >= kMaxYieldedRounds) {
+                throw lib::ANNException(
+                    "SeqlockVisitor: exceeded retry limit for node " +
+                    std::to_string(node_id) + " after " + std::to_string(total_attempts) +
+                    " attempts"
+                );
+            }
+            std::this_thread::yield();
         }
     }
 };
