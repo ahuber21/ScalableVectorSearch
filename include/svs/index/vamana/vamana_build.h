@@ -165,7 +165,8 @@ template <
     graphs::MemoryGraph Graph,
     data::ImmutableMemoryDataset Data,
     typename Dist,
-    threads::ThreadPool Pool>
+    threads::ThreadPool Pool,
+    typename Locks>
 class VamanaBuilder {
   public:
     // Type Aliases
@@ -184,6 +185,7 @@ class VamanaBuilder {
         Dist distance_function,
         const VamanaBuildParameters& params,
         Pool& threadpool,
+        Locks& vertex_locks,
         GreedySearchPrefetchParameters prefetch_hint = {},
         svs::logging::logger_ptr logger = svs::logging::get(),
         logging::Level level = logging::Level::Debug
@@ -194,7 +196,7 @@ class VamanaBuilder {
         , params_{params}
         , prefetch_hint_{prefetch_hint}
         , threadpool_{threadpool}
-        , vertex_locks_(data.size())
+        , vertex_locks_{vertex_locks}
         , backedge_buffer_{data.size(), 1000} {
         // Print all parameters
         svs::logging::log(
@@ -499,6 +501,19 @@ class VamanaBuilder {
             [&](const auto& is, uint64_t SVS_UNUSED(tid)) {
                 for (auto node_id : is) {
                     for (auto other_id : graph_.get_node(node_id)) {
+                        // Under SeqlockSync: always-on bounds check throws on out-of-range
+                        // access. Under SequentialSync: no check (compiles to nothing).
+                        if constexpr (!std::is_empty_v<Locks>) {
+                            if (other_id >= vertex_locks_.size()) {
+                                throw ANNEXCEPTION(
+                                    "Vertex lock array out of bounds: other_id={}, "
+                                    "array_size={}, node_id={}",
+                                    other_id,
+                                    vertex_locks_.size(),
+                                    node_id
+                                );
+                            }
+                        }
                         std::lock_guard lock{vertex_locks_[other_id]};
                         // The mutex above serializes writers; this guard protects
                         // concurrent searchers from torn reads.
@@ -602,9 +617,10 @@ class VamanaBuilder {
     GreedySearchPrefetchParameters prefetch_hint_;
     /// Worker threadpool.
     Pool& threadpool_;
-    // Serializes concurrent back-edge insertion in add_reverse_edges. The back-edge loop
-    // runs under parallel_for; a no-op lock here races on shared adjacency lists.
-    std::vector<SpinLock> vertex_locks_;
+    // Per-vertex locks for add_reverse_edges; supplied by caller, sized to cover the graph.
+    // Under SequentialSync: transient function-local array. Under SeqlockSync: index member
+    // grown inside slot_alloc_mutex_ alongside the graph, so every reachable id has a lock.
+    Locks& vertex_locks_;
     /// Overflow backedge buffer.
     BackedgeBuffer<Idx> backedge_buffer_;
 };

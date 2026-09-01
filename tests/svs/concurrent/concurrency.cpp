@@ -590,3 +590,73 @@ CATCH_TEST_CASE("Concurrent MutableVamanaIndex batch iterator", "[concurrent][in
         CATCH_REQUIRE(batches_completed.load() > 0);
     }
 }
+
+// Reproduce the vertex lock array bounds violation: two concurrent writers, graph size
+// crossing the builder's captured array size. Before the fix, VamanaBuilder sized its lock
+// array from data_.size() at construction; a second writer growing the graph between that
+// capture and add_reverse_edges yielded an out-of-range index into vertex_locks_. The
+// out-of-range element reinterpreted heap garbage as std::atomic<bool>; when non-zero, the
+// SpinLock hung. With the bounds assertion enabled, this aborts instead of hanging.
+//
+// At 2000/500 (initial/increment), the defect is deterministic: instrumented measurement
+// showed 5 of 5 aborts within 3 seconds, and without instrumentation 5 of 5 hangs beyond
+// 120 seconds. The fix inverts the dependency so the builder takes the lock array by
+// reference from its caller, and under SeqlockSync the array is grown alongside the graph
+// inside slot_alloc_mutex_.
+CATCH_TEST_CASE(
+    "Vertex lock array covers concurrent graph growth", "[concurrent][index][vamana]"
+) {
+    constexpr size_t kInitial = 2000;
+    constexpr size_t kIncrement = 500;
+    constexpr size_t kPerWriter = kIncrement / 2;
+    constexpr size_t kBatch = 25;
+
+    auto base = random_vectors(kInitial + kIncrement, kDim, 9876);
+    std::vector<size_t> initial_ids(kInitial);
+    std::iota(initial_ids.begin(), initial_ids.end(), 0);
+
+    auto initial_slice =
+        std::vector<float>(base.begin(), base.begin() + static_cast<long>(kInitial * kDim));
+    auto index = build_index(initial_slice, kDim, initial_ids, kBuildThreads);
+
+    auto sp = index->get_search_parameters();
+    sp.buffer_config({100});
+    index->set_search_parameters(sp);
+
+    std::atomic<size_t> exceptions{0};
+    std::atomic<size_t> completed{0};
+
+    auto writer = [&](size_t w) {
+        try {
+            const size_t begin = kInitial + w * kPerWriter;
+            for (size_t offset = 0; offset < kPerWriter; offset += kBatch) {
+                const size_t n = std::min(kBatch, kPerWriter - offset);
+                add_batch(*index, base, begin + offset, n);
+            }
+            completed.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::thread w0(writer, 0);
+    std::thread w1(writer, 1);
+    w0.join();
+    w1.join();
+
+    CATCH_REQUIRE(exceptions.load() == 0);
+    CATCH_REQUIRE(completed.load() == 2);
+    CATCH_REQUIRE(index->size() == kInitial + kIncrement);
+}
+
+// Footprint measurement for verification
+CATCH_TEST_CASE("Report MutableVamanaIndex footprint", "[.][footprint]") {
+    using namespace svs;
+    using Index = index::vamana::MutableVamanaIndex<
+        graphs::SimpleGraph<uint32_t>,
+        data::SimpleData<float>,
+        distance::DistanceL2,
+        index::vamana::SequentialSync>;
+    CATCH_INFO("sizeof(MutableVamanaIndex<SequentialSync>)=" << sizeof(Index));
+    CATCH_REQUIRE(true);
+}

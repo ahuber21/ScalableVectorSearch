@@ -196,6 +196,10 @@ class MutableVamanaIndex {
     [[no_unique_address]] typename Sync::mutex_type slot_alloc_mutex_;
     [[no_unique_address]] mutable typename Sync::mutex_type translator_mutex_;
     [[no_unique_address]] mutable typename Sync::mutex_type compact_mutex_;
+    // Per-vertex locks for VamanaBuilder. SeqlockSync: grown alongside the graph inside
+    // slot_alloc_mutex_; every id reachable from the graph has a lock at a stable address.
+    // SequentialSync: empty (builds allocate transiently, no steady-state footprint).
+    [[no_unique_address]] typename Sync::vertex_locks_type vertex_locks_;
 
     // Thread local data structures.
     distance_type distance_;
@@ -290,12 +294,15 @@ class MutableVamanaIndex {
         auto sp = get_search_parameters();
         auto prefetch_parameters =
             GreedySearchPrefetchParameters{sp.prefetch_lookahead_, sp.prefetch_step_};
+        // Ensure lock array is sized to cover the initial graph.
+        vertex_locks_.resize(data_.size());
         auto builder = VamanaBuilder(
             graph_,
             data_,
             distance_,
             build_parameters_,
             threadpool_,
+            vertex_locks_,
             prefetch_parameters,
             logger_
         );
@@ -838,6 +845,10 @@ class MutableVamanaIndex {
                 // However, we are only growing here, so resizing will not change any
                 // invariants.
                 graph_.unsafe_resize(new_size);
+                // Grow lock array alongside graph so every reachable id has a lock. Under
+                // SeqlockSync the array is segment-stable. Under SequentialSync it is
+                // empty.
+                vertex_locks_.resize(new_size);
                 status_.resize(new_size, SlotMetadata::Empty);
 
                 // Append the correct number of extra slots.
@@ -886,6 +897,7 @@ class MutableVamanaIndex {
             distance_,
             parameters,
             threadpool_,
+            vertex_locks_,
             prefetch_parameters,
             logger_,
             logging::Level::Trace};
@@ -1077,6 +1089,7 @@ class MutableVamanaIndex {
         // Resize the graph and data.
         graph_.unsafe_resize(max_index);
         data_.resize(max_index);
+        vertex_locks_.resize(max_index);
         first_empty_.store(max_index);
 
         // Compact metadata and ID remapping.

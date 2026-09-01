@@ -32,6 +32,7 @@
 #include "svs/lib/concurrency/readwrite_protected.h"
 #include "svs/lib/preprocessor.h"
 #include "svs/lib/saveload.h"
+#include "svs/lib/spinlock.h"
 #include "svs/lib/threads.h"
 
 // stl
@@ -428,12 +429,16 @@ class VamanaIndex {
         build_parameters_ = parameters;
         // verify the parameters before set local var
         verify_and_set_default_index_parameters(build_parameters_, distance_function);
+        // Transient lock array for single-threaded build: sized to data, freed when build
+        // completes.
+        std::vector<SpinLock> vertex_locks(data_.size());
         auto builder = VamanaBuilder(
             graph_,
             data_,
             distance_,
             build_parameters_,
             threadpool_,
+            vertex_locks,
             extensions::estimate_prefetch_parameters(data_),
             logger
         );

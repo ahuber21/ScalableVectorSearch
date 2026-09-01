@@ -23,7 +23,9 @@
 #include "svs/lib/concurrency/atomic_value.h"
 #include "svs/lib/movable_mutex.h"
 #include "svs/lib/null_mutex.h"
+#include "svs/lib/relocatable_spinlock.h"
 #include "svs/lib/segmented_vector.h"
+#include "svs/lib/spinlock.h"
 
 #include "svs/index/vamana/greedy_search.h"
 
@@ -131,6 +133,19 @@ concept SyncPolicy = requires {
 template <typename P, typename Graph>
 concept SyncPolicyFor = SyncPolicy<P> && NodeVisitor<typename P::node_visitor_type, Graph>;
 
+/// @brief Empty lock array for single-threaded builds (zero-overhead placeholder).
+struct EmptyLockArray {
+    void resize(size_t) const noexcept {}
+    constexpr size_t size() const noexcept { return std::numeric_limits<size_t>::max(); }
+    // Satisfy indexed access: returns a reference to a static lock (never actually used).
+    SpinLock& operator[](size_t) noexcept {
+        static SpinLock unused;
+        return unused;
+    }
+};
+
+static_assert(std::is_empty_v<EmptyLockArray>, "EmptyLockArray must be empty");
+
 /// @brief Synchronization policy for single-threaded use.
 ///
 /// Every seam is the identity: the mutexes compile away, the counters are plain values and
@@ -140,12 +155,16 @@ struct SequentialSync {
     using counter_type = PlainCounter;
     using graph_access_type = graphs::PlainAccess;
     using growth_type = data::Reallocating;
+    using vertex_locks_type = EmptyLockArray;
 
     using node_visitor_type = VisitOnce;
     template <typename T> using container_type = std::vector<T>;
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
     static constexpr bool reserves_pending_slots = false;
+
+    /// Sequential builds own a transient lock array; no steady-state footprint.
+    static constexpr bool has_vertex_locks = false;
 };
 
 /// @brief Synchronization policy for concurrent readers with seqlock-protected adjacency.
@@ -157,6 +176,7 @@ struct SeqlockSync {
     using counter_type = AtomicCounter;
     using graph_access_type = graphs::SeqlockAccess;
     using growth_type = data::SegmentStable;
+    using vertex_locks_type = lib::SegmentedVector<RelocatableSpinLock>;
 
     using node_visitor_type = SeqlockVisitor;
     // Lock-free readers (greedy_search inside ValidBuilder) access this container while
@@ -164,6 +184,9 @@ struct SeqlockSync {
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
+
+    /// Concurrent index owns a grow-stable lock array that lives as long as the graph.
+    static constexpr bool has_vertex_locks = true;
 };
 
 static_assert(SyncCounter<PlainCounter>);
