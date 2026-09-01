@@ -461,7 +461,9 @@ CATCH_TEST_CASE("Multi: Sync policy compile-time routing", "[index][vamana][mult
     // Force instantiation and verify that SeqlockSync is threaded into the parent.
     using Distance = svs::DistanceL2;
     using Eltype = float;
-    using Data = svs::data::SimpleData<Eltype>;
+    using DataAlloc =
+        svs::data::Blocked<svs::lib::Allocator<Eltype>, svs::data::SegmentStable>;
+    using Data = svs::data::SimpleData<Eltype, svs::Dynamic, DataAlloc>;
     using GraphAlloc =
         svs::data::Blocked<svs::lib::Allocator<uint32_t>, svs::data::SegmentStable>;
     using GraphData = svs::data::SimpleData<uint32_t, svs::Dynamic, GraphAlloc>;
@@ -514,12 +516,17 @@ CATCH_TEST_CASE(
     CATCH_REQUIRE(index.size() == num_points);
     CATCH_REQUIRE(index.labelcount() == num_points);
 
-    // Verify the deduced type is sequential by checking that the parent uses NullMutex.
+    // Verify the deduced type is sequential by checking the full parent type.
     using IndexType = decltype(index);
     using ParentType = typename IndexType::ParentIndex;
+    using ExpectedParentType = svs::index::vamana::MutableVamanaIndex<
+        svs::graphs::SimpleBlockedGraph<uint32_t>,
+        svs::data::SimpleData<Eltype, N>,
+        Distance,
+        svs::index::vamana::SequentialSync>;
     static_assert(
-        std::is_same_v<typename ParentType::Sync::mutex_type, svs::lib::NullMutex>,
-        "Default instantiation must use SequentialSync with NullMutex"
+        std::is_same_v<ParentType, ExpectedParentType>,
+        "Default instantiation must deduce SequentialSync"
     );
 }
 

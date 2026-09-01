@@ -159,15 +159,19 @@ template <
     graphs::MemoryGraph Graph,
     typename Data,
     typename Dist,
-    typename Mutex = lib::NullMutex>
+    typename Sync = SequentialSync>
 class MultiMutableVamanaIndex {
   public:
+    static_assert(
+        SyncPolicyFor<Sync, Graph>, "Sync must satisfy SyncPolicyFor<Sync, Graph>"
+    );
+
     static constexpr bool supports_insertions = true;
     static constexpr bool supports_deletions = true;
     static constexpr bool supports_saving = false; // temporary disable for now
     static constexpr bool needs_id_translation = true;
 
-    using ParentIndex = MutableVamanaIndex<Graph, Data, Dist>;
+    using ParentIndex = MutableVamanaIndex<Graph, Data, Dist, Sync>;
     using compare = distance::compare_t<Dist>;
     using Idx = typename ParentIndex::Idx;
     using search_parameters_type = typename ParentIndex::search_parameters_type;
@@ -185,7 +189,7 @@ class MultiMutableVamanaIndex {
     // Counter type: plain for NullMutex, atomic wrapped in unique_ptr otherwise.
     // The unique_ptr wrapper keeps the class movable when Mutex is a real mutex.
     using counter_type = std::conditional_t<
-        std::is_same_v<Mutex, lib::NullMutex>,
+        std::is_same_v<typename Sync::mutex_type, lib::NullMutex>,
         external_id_type,
         std::unique_ptr<std::atomic<external_id_type>>>;
 
@@ -199,11 +203,11 @@ class MultiMutableVamanaIndex {
     // entries only during consolidation. Guarded by l2e_mutex_.
     label_to_external_type pending_deletes_;
     // Lock ordering: always acquire l2e_mutex_ before e2l_mutex_ to avoid deadlock.
-    [[no_unique_address]] Mutex l2e_mutex_;
-    [[no_unique_address]] Mutex e2l_mutex_;
+    [[no_unique_address]] typename Sync::mutex_type l2e_mutex_;
+    [[no_unique_address]] typename Sync::mutex_type e2l_mutex_;
 
     static constexpr counter_type init_counter() {
-        if constexpr (std::is_same_v<Mutex, lib::NullMutex>) {
+        if constexpr (std::is_same_v<typename Sync::mutex_type, lib::NullMutex>) {
             return 0;
         } else {
             return std::make_unique<std::atomic<external_id_type>>(0);
@@ -211,7 +215,7 @@ class MultiMutableVamanaIndex {
     }
 
     external_id_type fetch_and_increment_counter() {
-        if constexpr (std::is_same_v<Mutex, lib::NullMutex>) {
+        if constexpr (std::is_same_v<typename Sync::mutex_type, lib::NullMutex>) {
             return counter_++;
         } else {
             return counter_->fetch_add(1, std::memory_order_relaxed);
@@ -786,7 +790,7 @@ MultiMutableVamanaIndex(
         graphs::SimpleBlockedGraph<uint32_t>,
         Data,
         Dist,
-        lib::NullMutex>;
+        SequentialSync>;
 
 template <typename Data, typename Dist, typename ExternalIds, threads::ThreadPool Pool>
 MultiMutableVamanaIndex(const VamanaBuildParameters&, Data, const ExternalIds&, Dist, Pool)
@@ -794,7 +798,7 @@ MultiMutableVamanaIndex(const VamanaBuildParameters&, Data, const ExternalIds&, 
         graphs::SimpleBlockedGraph<uint32_t>,
         Data,
         Dist,
-        lib::NullMutex>;
+        SequentialSync>;
 
 // Guide with logging
 template <typename Data, typename Dist, typename ExternalIds, threads::ThreadPool Pool>
@@ -810,7 +814,7 @@ MultiMutableVamanaIndex(
         graphs::SimpleBlockedGraph<uint32_t>,
         Data,
         Dist,
-        lib::NullMutex>;
+        SequentialSync>;
 
 // Guide for reload with labels
 template <typename Graph, typename Data, typename Dist, threads::ThreadPool Pool>
@@ -822,7 +826,7 @@ MultiMutableVamanaIndex(
     const std::vector<size_t>&,
     Pool,
     svs::logging::logger_ptr
-) -> MultiMutableVamanaIndex<Graph, Data, Dist, lib::NullMutex>;
+) -> MultiMutableVamanaIndex<Graph, Data, Dist, SequentialSync>;
 
 // Guide for reload with IDTranslator
 template <typename Graph, typename Data, typename Dist, threads::ThreadPool Pool>
@@ -834,7 +838,7 @@ MultiMutableVamanaIndex(
     IDTranslator,
     Pool,
     svs::logging::logger_ptr
-) -> MultiMutableVamanaIndex<Graph, Data, Dist, lib::NullMutex>;
+) -> MultiMutableVamanaIndex<Graph, Data, Dist, SequentialSync>;
 
 enum class MultiMutableVamanaLoad { FROM_MULTI, FROM_DYNAMIC, FROM_STATIC };
 
