@@ -146,6 +146,7 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/index/vamana/search_parameters.cpp
     ${TEST_DIR}/svs/index/vamana/sync_policy.cpp
     ${TEST_DIR}/svs/index/vamana/vamana_build.cpp
+    ${TEST_DIR}/svs/index/vamana/node_visitor.cpp
     #${TEST_DIR}/svs/index/vamana/iterator_schedule.cpp
     ${TEST_DIR}/svs/index/vamana/iterator_example.cpp
     ${TEST_DIR}/svs/index/vamana/iterator.cpp
