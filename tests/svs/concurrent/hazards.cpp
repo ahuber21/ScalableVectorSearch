@@ -123,15 +123,29 @@ template <typename F> bool with_timeout(F&& operation, std::chrono::milliseconds
 
 // Property 1: a failed insert (exception thrown during add_points) must not strand the
 // index in a state where subsequent operations deadlock on Pending slots.
+//
+// FINDING: Cannot write without library changes. Two approaches attempted:
+// 1. Throwing distance functor: does not satisfy distance concept (requires fix_argument,
+//    compute as member/ADL with complex overload resolution).
+// 2. Throwing allocator: index reuses empty slots so add_points doesn't trigger allocation
+//    when capacity exists, and shared_ptr state makes per-call control infeasible.
+//
+// The property requires injecting a controlled mid-insert failure. Neither template
+// parameter (Distance, Allocator) provides a clean injection point without either:
+// (a) satisfying complex concept requirements, or (b) modifying index internals to expose
+// a test hook. Recommend adding a test-only hook (e.g., a callback invoked mid-insert)
+// or relaxing the distance concept to allow simpler wrappers.
+//
+// Input validation finding: add_points at include/svs/index/vamana/dynamic_index.h:827
+// does not validate data dimensions, ID uniqueness, or data/ID count mismatch. Malformed
+// input causes segfaults, not catchable exceptions.
 CATCH_TEST_CASE("Failed insert leaves index usable", "[concurrent][hazards]") {
-    // FINDING: Cannot write this test without library changes. The index does not validate
-    // input or provide a public way to trigger a catchable exception from add_points.
-    // Dimension mismatches, empty data, and other malformed inputs cause segfaults, not
-    // exceptions. The property (Pending slots do not deadlock) cannot be tested directly
-    // without either (a) injecting failures into the library, or (b) the library providing
-    // input validation that throws on invalid data.
-    CATCH_SKIP("Cannot trigger catchable exception from add_points; "
-               "input validation needed to test exception-safety");
+    CATCH_SKIP("Cannot write without library changes: see file comments for findings");
+    // FINDINGS documented above test case:
+    // 1. Distance concept too complex for simple throwing wrapper.
+    // 2. Allocator approach doesn't trigger reliably (empty slot reuse).
+    // 3. Input validation missing at dynamic_index.h:827 (dimension, ID checks).
+    // Recommend: add test hook for controlled mid-insert failure.
 }
 
 // Property 2: the graph entry point must always be in Valid state, never Empty or Pending.
@@ -147,39 +161,41 @@ CATCH_TEST_CASE("Entry point is always visible to search", "[concurrent][hazards
     sp.buffer_config({100});
     index->set_search_parameters(sp);
 
-    // After initial build, entry point must be valid: search and invariants must pass.
-    auto scratch = index->scratchspace();
-    CATCH_REQUIRE_NOTHROW(
-        index->search(std::span<const float>(queries_raw.data(), kDim), scratch)
-    );
+    auto check_entry_point_valid = [&] {
+        auto ep = index->entry_point();
+        auto live = index->nonmissing_indices();
+        // Entry point must be in the live set (Valid slots).
+        CATCH_REQUIRE(std::find(live.begin(), live.end(), ep) != live.end());
+    };
+
+    // After initial build, entry point must be Valid.
+    check_entry_point_valid();
     CATCH_REQUIRE_NOTHROW(index->debug_check_invariants(true));
 
-    // Insert new points: entry point must remain valid.
+    // Insert new points: entry point must remain Valid.
     auto point = svs::data::SimpleData<float>(1, kDim);
     point.set_datum(0, std::span<const float>(base.data(), kDim));
     index->add_points(point, std::vector<size_t>{kInitialPoints + 50});
-    CATCH_REQUIRE_NOTHROW(
-        index->search(std::span<const float>(queries_raw.data() + kDim, kDim), scratch)
-    );
+    check_entry_point_valid();
     CATCH_REQUIRE_NOTHROW(index->debug_check_invariants(true));
 
     // Delete points including potentially the entry point itself: entry point must be
-    // recomputed to a valid slot. This is the case most likely to expose the hazard.
+    // recomputed to a Valid slot. This is the case most likely to expose the hazard.
+    auto initial_ep = index->entry_point();
     std::vector<size_t> to_delete;
-    for (size_t i = 0; i < kInitialPoints / 4; ++i) {
+    // Delete a range that likely includes the entry point.
+    for (size_t i = 0; i < kInitialPoints / 2; ++i) {
         to_delete.push_back(i);
     }
     index->delete_entries(to_delete);
-    CATCH_REQUIRE_NOTHROW(
-        index->search(std::span<const float>(queries_raw.data() + 2 * kDim, kDim), scratch)
-    );
+    check_entry_point_valid();
     CATCH_REQUIRE_NOTHROW(index->debug_check_invariants(true));
 
-    // After consolidate (if available), entry point must still be valid.
-    // Consolidate is not yet implemented for SeqlockSync; once available, uncomment:
-    // index->consolidate();
-    // CATCH_REQUIRE_NOTHROW(index->search(...));
-    // CATCH_REQUIRE_NOTHROW(index->debug_check_invariants(false));
+    // If the entry point changed, it was recomputed correctly.
+    auto new_ep = index->entry_point();
+    if (initial_ep != new_ep) {
+        CATCH_INFO("Entry point recomputed from " << initial_ep << " to " << new_ep);
+    }
 
     CATCH_REQUIRE(index->size() > 0);
 }
