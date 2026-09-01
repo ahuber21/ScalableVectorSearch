@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -240,16 +241,26 @@ CATCH_TEST_CASE("Concurrent MutableVamanaIndex quiescent recall", "[concurrent][
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex search during mutation", "[concurrent][index]"
 ) {
-    CATCH_SKIP("Test is too slow to run in the suite at its current size");
-    const size_t total = kInitialPoints + kIncrementalPoints;
+    auto envnum = [](const char* name, size_t fallback) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : fallback;
+    };
+    const size_t local_initial = envnum("SVS_MUT_INITIAL", 200);
+    const size_t local_incremental = envnum("SVS_MUT_INCR", 50);
+    const size_t local_queries = envnum("SVS_MUT_QUERIES", 10);
+    const size_t local_batch = envnum("SVS_MUT_BATCH", 25);
+    const size_t local_writers = envnum("SVS_MUT_WRITERS", 2);
+    const int local_searchers = static_cast<int>(envnum("SVS_MUT_SEARCHERS", 2));
+
+    const size_t total = local_initial + local_incremental;
     auto base = random_vectors(total, kDim, 4321);
 
-    std::vector<size_t> initial_ids(kInitialPoints);
+    std::vector<size_t> initial_ids(local_initial);
     std::iota(initial_ids.begin(), initial_ids.end(), 0);
-    // Build over the first ``kInitialPoints`` only; the tail is inserted concurrently
+    // Build over the first ``local_initial`` only; the tail is inserted concurrently
     // below.
     auto initial_slice = std::vector<float>(
-        base.begin(), base.begin() + static_cast<long>(kInitialPoints * kDim)
+        base.begin(), base.begin() + static_cast<long>(local_initial * kDim)
     );
     auto index = build_index(initial_slice, kDim, initial_ids, kBuildThreads);
 
@@ -257,7 +268,7 @@ CATCH_TEST_CASE(
     sp.buffer_config({100});
     index->set_search_parameters(sp);
 
-    auto queries_raw = random_vectors(kNumQueries, kDim, 777);
+    auto queries_raw = random_vectors(local_queries, kDim, 777);
     auto queries = make_dataset(queries_raw, kDim);
 
     std::atomic<size_t> writers_running{0};
@@ -266,18 +277,13 @@ CATCH_TEST_CASE(
     std::atomic<size_t> duplicate_ids{0};
     std::atomic<size_t> exceptions{0};
 
-    // Two writer threads insert *disjoint* halves of the incremental points concurrently.
-    // Concurrent `add_points` is the headline capability of this index: the slot allocator
-    // is the only serialized section, and graph/data growth is lock-free.
-    constexpr size_t kWriters = 2;
-    constexpr size_t kBatch = 500;
-    const size_t per_writer = kIncrementalPoints / kWriters;
+    const size_t per_writer = local_incremental / local_writers;
 
     auto writer = [&](size_t w) {
         try {
-            const size_t begin = kInitialPoints + w * per_writer;
-            for (size_t offset = 0; offset < per_writer; offset += kBatch) {
-                const size_t n = std::min(kBatch, per_writer - offset);
+            const size_t begin = local_initial + w * per_writer;
+            for (size_t offset = 0; offset < per_writer; offset += local_batch) {
+                const size_t n = std::min(local_batch, per_writer - offset);
                 add_batch(*index, base, begin + offset, n);
 
                 // Delete a fresh, disjoint set of the original IDs each round, *spread*
@@ -287,9 +293,9 @@ CATCH_TEST_CASE(
                 // unexercised. Each (writer, round) pair takes its own residue class mod
                 // 40, so the rounds are disjoint and together retire a quarter of the
                 // original vectors.
-                const size_t round = w * (per_writer / kBatch) + offset / kBatch;
+                const size_t round = w * (per_writer / local_batch) + offset / local_batch;
                 std::vector<size_t> to_delete;
-                for (size_t id = round; id < kInitialPoints; id += 40) {
+                for (size_t id = round; id < local_initial; id += 40) {
                     to_delete.push_back(id);
                 }
                 index->delete_entries(to_delete);
@@ -306,7 +312,7 @@ CATCH_TEST_CASE(
             auto scratch = index->scratchspace();
             std::unordered_set<Idx> seen_ids;
             while (writers_running.load(std::memory_order_relaxed) != 0) {
-                for (size_t q = 0; q < kNumQueries; ++q) {
+                for (size_t q = 0; q < local_queries; ++q) {
                     auto query =
                         std::span<const float>(queries_raw.data() + q * kDim, kDim);
                     index->search(query, scratch);
@@ -348,11 +354,11 @@ CATCH_TEST_CASE(
     };
 
     std::vector<std::thread> threads;
-    writers_running.store(kWriters);
-    for (size_t w = 0; w < kWriters; ++w) {
+    writers_running.store(local_writers);
+    for (size_t w = 0; w < local_writers; ++w) {
         threads.emplace_back(writer, w);
     }
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < local_searchers; ++i) {
         threads.emplace_back(searcher);
     }
     for (auto& t : threads) {
@@ -372,7 +378,7 @@ CATCH_TEST_CASE(
     CATCH_REQUIRE(live.size() == index->size());
 
     auto truth = ground_truth(base, live, queries_raw, kDim, kNumNeighbors);
-    auto results = svs::QueryResult<size_t>{kNumQueries, kNumNeighbors};
+    auto results = svs::QueryResult<size_t>{local_queries, kNumNeighbors};
     index->search(results.view(), queries, index->get_search_parameters());
     const double recall = recall_at_k(results, truth);
     CATCH_INFO("post-mutation recall@" << kNumNeighbors << " = " << recall);
