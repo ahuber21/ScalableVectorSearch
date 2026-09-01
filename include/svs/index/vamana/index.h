@@ -302,6 +302,8 @@ class VamanaIndex {
     using search_buffer_type = SearchBuffer<Idx, distance::compare_t<Dist>>;
     /// Type of the graph.
     using graph_type = Graph;
+    /// Type of the node visitor for greedy search.
+    using node_visitor_type = VisitOnce;
     /// Type of the dataset.
     using data_type = Data;
     using entry_point_type = std::vector<Idx>;
@@ -493,7 +495,8 @@ class VamanaIndex {
                 vamana::EntryPointInitializer<Idx>{lib::as_const_span(entry_point_)},
                 internal_search_builder(),
                 prefetch_parameters,
-                cancel
+                cancel,
+                node_visitor_type{}
             );
         };
     }

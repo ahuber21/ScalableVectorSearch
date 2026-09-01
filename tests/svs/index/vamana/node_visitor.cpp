@@ -48,15 +48,16 @@ template <typename Access> class TornReadMockGraph {
     TornReadMockGraph(std::vector<Idx> valid_neighbors, std::vector<Idx> garbage_neighbors)
         : valid_{std::move(valid_neighbors)}
         , garbage_{std::move(garbage_neighbors)}
-        , read_count_{0} {}
+        , attempt_{0} {}
 
     size_t n_nodes() const { return 10; }
     size_t max_degree() const { return std::max(valid_.size(), garbage_.size()); }
 
     const_reference get_node(Idx id) const {
         if (id == 0) {
-            // On first read, return garbage. On subsequent reads, return valid neighbors.
-            if (read_count_++ == 0) {
+            // On first attempt, return garbage. On subsequent attempts, return valid.
+            size_t current_attempt = attempt_.load(std::memory_order_relaxed);
+            if (current_attempt == 0) {
                 return std::span<const Idx>(garbage_.data(), garbage_.size());
             }
         }
@@ -66,19 +67,20 @@ template <typename Access> class TornReadMockGraph {
     size_t get_node_degree(Idx /*id*/) const { return valid_.size(); }
     void prefetch_node(Idx /*id*/) const {}
 
-    // Seqlock interface: first read (seq=0) will fail validation.
+    // Seqlock interface: first attempt fails validation to trigger retry.
     std::optional<uint32_t> read_begin(Idx id) const {
         if (id == 0) {
-            return static_cast<uint32_t>(read_count_.load());
+            // Return even number (valid for read)
+            return static_cast<uint32_t>(attempt_.load(std::memory_order_relaxed) * 2);
         }
         return 0;
     }
 
     bool read_validate(Idx id, uint32_t seq) const {
         if (id == 0) {
-            // First call has seq=0, read_count_=1 after get_node, so fails.
-            // Second call has seq=1, read_count_=2 after get_node, so succeeds.
-            return static_cast<uint32_t>(read_count_.load()) == seq;
+            size_t current = attempt_.fetch_add(1, std::memory_order_relaxed);
+            // First validation (current==0) fails, second (current==1) succeeds
+            return current > 0 && seq == static_cast<uint32_t>(current * 2);
         }
         return true;
     }
@@ -86,7 +88,7 @@ template <typename Access> class TornReadMockGraph {
   private:
     std::vector<Idx> valid_;
     std::vector<Idx> garbage_;
-    mutable std::atomic<size_t> read_count_;
+    mutable std::atomic<size_t> attempt_;
 };
 
 // Mock graph that never validates a specific node, forcing retry exhaustion.
@@ -137,12 +139,16 @@ CATCH_TEST_CASE(
 ) {
     // Test that VisitOnce passes through the graph's neighbors directly.
     using Graph = svs::graphs::SimpleBlockedGraph<Idx>;
-    std::vector<std::vector<Idx>> adjacency = {{1, 2, 3}, {0, 2}, {0, 1}};
-    auto data = svs::data::SimpleData<Idx>(adjacency.size(), adjacency[0].size());
-    for (size_t i = 0; i < adjacency.size(); ++i) {
-        data.set_datum(i, std::span<const Idx>(adjacency[i].data(), adjacency[i].size()));
-    }
-    Graph graph{std::move(data), adjacency[0].size()};
+    const size_t max_degree = 3;
+    Graph graph{3, max_degree};
+
+    // Set up the graph with known neighbors
+    std::vector<Idx> neighbors_0 = {1, 2, 3};
+    std::vector<Idx> neighbors_1 = {0, 2};
+    std::vector<Idx> neighbors_2 = {0, 1};
+    graph.replace_node(0, std::span<const Idx>(neighbors_0.data(), neighbors_0.size()));
+    graph.replace_node(1, std::span<const Idx>(neighbors_1.data(), neighbors_1.size()));
+    graph.replace_node(2, std::span<const Idx>(neighbors_2.data(), neighbors_2.size()));
 
     svs::index::vamana::VisitOnce visitor{};
 

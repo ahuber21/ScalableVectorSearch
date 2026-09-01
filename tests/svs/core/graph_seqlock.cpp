@@ -252,14 +252,14 @@ CATCH_TEST_CASE("SeqlockVisitor retries on validation failure", "[graphs][seqloc
     }
 
     // Create visitor
-    svs::index::vamana::SeqlockVisitor visitor{graph};
+    svs::index::vamana::SeqlockVisitor visitor{};
 
     // Test that visitor executes the body and it satisfies NodeVisitor
-    static_assert(svs::index::vamana::NodeVisitor<
-                  svs::index::vamana::SeqlockVisitor<SeqlockGraph>>);
+    static_assert(svs::index::vamana::
+                      NodeVisitor<svs::index::vamana::SeqlockVisitor, SeqlockGraph>);
 
     size_t executions = 0;
-    visitor(5, [&]() { ++executions; });
+    visitor(graph, 5, [&](const auto& /*neighbors*/) { ++executions; });
 
     CATCH_REQUIRE(executions > 0);
 }

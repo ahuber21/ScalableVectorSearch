@@ -381,7 +381,9 @@ class VamanaBuilder {
                             vamana::EntryPointInitializer{lib::as_const_span(entry_points)},
                             NeighborBuilder(),
                             tracker,
-                            prefetch_hint_
+                            prefetch_hint_,
+                            lib::Returns(lib::Const<false>()),
+                            VisitOnce{}
                         );
                     }
 

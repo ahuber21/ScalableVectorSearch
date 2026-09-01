@@ -46,9 +46,7 @@ static_assert(std::is_same_v<vamana::SequentialSync::mutex_type, svs::lib::NullM
 static_assert(std::is_same_v<
               vamana::SequentialSync::graph_access_type,
               svs::graphs::PlainAccess>);
-static_assert(std::is_same_v<
-              vamana::SequentialSync::node_visitor_type<TestGraph>,
-              vamana::VisitOnce>);
+static_assert(std::is_same_v<vamana::SequentialSync::node_visitor_type, vamana::VisitOnce>);
 static_assert(std::is_same_v<vamana::SequentialSync::growth_type, svs::data::Reallocating>);
 static_assert(std::is_same_v<
               vamana::SequentialSync::template container_type<int>,
@@ -60,10 +58,10 @@ static_assert(!vamana::SequentialSync::reserves_pending_slots);
 static_assert(!vamana::SequentialSync::defers_translator_cleanup);
 static_assert(!vamana::SequentialSync::supplements_search_buffer);
 
-// The seqlock policy must yield SeqlockVisitor for its graph type.
+// The seqlock policy must yield SeqlockVisitor (no longer templated on graph).
 static_assert(std::is_same_v<
-              vamana::SeqlockSync::node_visitor_type<TestGraph>,
-              vamana::SeqlockVisitor<TestGraph>>);
+              vamana::SeqlockSync::node_visitor_type,
+              vamana::SeqlockVisitor>);
 static_assert(vamana::SyncPolicy<vamana::SeqlockSync>);
 static_assert(vamana::SyncPolicyFor<vamana::SeqlockSync, TestGraph>);
 
@@ -86,7 +84,7 @@ struct BadVisitor {
     using counter_type = vamana::PlainCounter;
     using graph_access_type = svs::graphs::PlainAccess;
     using growth_type = svs::data::Reallocating;
-    template <typename Graph> using node_visitor_type = int;
+    using node_visitor_type = int;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
     static constexpr bool defers_translator_cleanup = false;

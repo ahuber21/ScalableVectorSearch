@@ -977,19 +977,22 @@ namespace {
 struct CountingVisitor {
     mutable std::set<size_t> invocations;
     mutable size_t total_calls = 0;
-    template <typename F> void operator()(size_t node_id, F&& body) const {
+    template <typename Graph, typename F>
+    void operator()(const Graph& graph, size_t node_id, F&& body) const {
         invocations.insert(node_id);
         ++total_calls;
-        body();
+        body(graph.get_node(static_cast<typename Graph::index_type>(node_id)));
     }
 };
 
 struct DoubleVisitor {
     mutable size_t invocations = 0;
-    template <typename F> void operator()(size_t /*node_id*/, F&& body) const {
+    template <typename Graph, typename F>
+    void operator()(const Graph& graph, size_t node_id, F&& body) const {
         ++invocations;
-        body();
-        body();
+        auto neighbors = graph.get_node(static_cast<typename Graph::index_type>(node_id));
+        body(neighbors);
+        body(neighbors);
     }
 };
 

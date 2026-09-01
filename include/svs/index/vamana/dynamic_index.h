@@ -164,6 +164,8 @@ class MutableVamanaIndex {
     using graph_type = Graph;
     using data_type = Data;
     using entry_point_type = std::vector<Idx>;
+    /// Type of the node visitor for greedy search.
+    using node_visitor_type = typename Sync::node_visitor_type;
     // The element type is policy-dependent: SeqlockSync wraps it to make each access
     // atomic, so size accounting must go through value_type rather than SlotMetadata.
     using status_type = typename Sync::template container_type<SlotMetadata>;
@@ -587,7 +589,8 @@ class MutableVamanaIndex {
                 vamana::EntryPointInitializer<Idx>{lib::as_const_span(entry_point_)},
                 internal_search_builder(),
                 prefetch_parameters,
-                cancel
+                cancel,
+                node_visitor_type{}
             );
             // Take a pass over the search buffer to remove any deleted elements that
             // might remain.

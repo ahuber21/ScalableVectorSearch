@@ -132,8 +132,7 @@ concept SyncPolicy = requires {
 
 /// @brief A synchronization policy together with the graph type it will be used with.
 template <typename P, typename Graph>
-concept SyncPolicyFor =
-    SyncPolicy<P> && NodeVisitor<typename P::template node_visitor_type<Graph>>;
+concept SyncPolicyFor = SyncPolicy<P> && NodeVisitor<typename P::node_visitor_type, Graph>;
 
 /// @brief Synchronization policy for single-threaded use.
 ///
@@ -145,7 +144,7 @@ struct SequentialSync {
     using graph_access_type = graphs::PlainAccess;
     using growth_type = data::Reallocating;
 
-    template <typename Graph> using node_visitor_type = VisitOnce;
+    using node_visitor_type = VisitOnce;
     template <typename T> using container_type = std::vector<T>;
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
@@ -166,7 +165,7 @@ struct SeqlockSync {
     using graph_access_type = graphs::SeqlockAccess;
     using growth_type = data::SegmentStable;
 
-    template <typename Graph> using node_visitor_type = SeqlockVisitor<Graph>;
+    using node_visitor_type = SeqlockVisitor;
     // Lock-free readers (greedy_search inside ValidBuilder) access this container while
     // writers (add_points) mutate it. Wrapping the element type makes every access atomic.
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
@@ -181,7 +180,7 @@ static_assert(SyncCounter<AtomicCounter>);
 static_assert(SyncPolicy<SequentialSync>);
 static_assert(SyncPolicy<SeqlockSync>);
 
-// Visitor aliases must instantiate cleanly and yield valid visitors.
+// Visitor types must satisfy NodeVisitor for representative graph types.
 static_assert(SyncPolicyFor<SequentialSync, graphs::SimpleGraph<uint32_t>>);
 static_assert(SyncPolicyFor<
               SeqlockSync,

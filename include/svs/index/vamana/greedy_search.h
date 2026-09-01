@@ -112,44 +112,82 @@ struct NeighborBuilder {
 };
 
 /// Default visitor that invokes the per-node expansion body exactly once.
+/// The body receives the graph's own neighbor range with no copy or validation.
 struct VisitOnce {
-    template <typename F> void operator()(size_t /*node_id*/, F&& body) const { body(); }
+    template <graphs::ImmutableMemoryGraph Graph, typename F>
+    void operator()(const Graph& graph, size_t node_id, F&& body) const {
+        body(graph.get_node(static_cast<typename Graph::index_type>(node_id)));
+    }
 };
 
 /// Visitor that wraps node expansion in a seqlock retry loop.
-/// Reads the node's seqlock counter before invoking the body, then validates afterward.
-/// On validation failure, retries the body. Stale entries already pushed into the search
-/// buffer are tolerated because the buffer deduplicates by ID.
-template <graphs::ImmutableMemoryGraph Graph> class SeqlockVisitor {
-  public:
-    explicit SeqlockVisitor(const Graph& graph)
-        : graph_{graph} {}
-
-    template <typename F> void operator()(size_t node_id, F&& body) const {
+/// Copies the adjacency list, validates, then invokes the body with the validated copy.
+/// On validation failure, retries from the beginning. The body is never invoked with
+/// torn data.
+struct SeqlockVisitor {
+    template <graphs::ImmutableMemoryGraph Graph, typename F>
+    void operator()(const Graph& graph, size_t node_id, F&& body) const {
         using Idx = typename Graph::index_type;
+        constexpr size_t kMaxRetries = 10'000;
+
+        // Thread-local scratch storage for the adjacency list copy.
+        thread_local std::vector<Idx> scratch;
+
+        // Ensure scratch is large enough for this graph's max degree.
+        if (scratch.size() < graph.max_degree()) {
+            scratch.resize(graph.max_degree());
+        }
+
+        Idx id = static_cast<Idx>(node_id);
+        size_t retry_count = 0;
+
         while (true) {
-            auto seq_opt = graph_.read_begin(static_cast<Idx>(node_id));
+            auto seq_opt = graph.read_begin(id);
             if (!seq_opt.has_value()) {
+                ++retry_count;
+                if (retry_count >= kMaxRetries) {
+                    throw lib::ANNException(
+                        "SeqlockVisitor: exceeded retry limit for node " +
+                        std::to_string(node_id) + " after " + std::to_string(retry_count) +
+                        " attempts"
+                    );
+                }
                 continue;
             }
-            body();
-            if (graph_.read_validate(static_cast<Idx>(node_id), seq_opt.value())) {
-                break;
+
+            // Copy the adjacency list into scratch.
+            auto neighbors = graph.get_node(id);
+            const size_t n = neighbors.size();
+            std::copy(neighbors.begin(), neighbors.end(), scratch.begin());
+
+            // Validate the read before publishing anything.
+            if (!graph.read_validate(id, seq_opt.value())) {
+                ++retry_count;
+                if (retry_count >= kMaxRetries) {
+                    throw lib::ANNException(
+                        "SeqlockVisitor: exceeded retry limit for node " +
+                        std::to_string(node_id) + " after " + std::to_string(retry_count) +
+                        " attempts"
+                    );
+                }
+                continue;
             }
+
+            // Validation succeeded. Call the body once with the validated copy.
+            body(std::span<const Idx>{scratch.data(), n});
+            return;
         }
     }
-
-  private:
-    const Graph& graph_;
 };
 
 /// Concept for per-node visitors.
-/// A visitor receives the node ID and a nullary callable body containing the expansion
-/// logic, and may invoke that body one or more times.
-template <typename V>
-concept NodeVisitor = requires(const V& visitor, size_t node_id) {
+/// A visitor receives the graph, node ID, and a callable body that accepts the
+/// neighbor range, and may invoke that body one or more times.
+template <typename V, typename Graph>
+concept NodeVisitor = graphs::ImmutableMemoryGraph<Graph> &&
+                      requires(const V& visitor, const Graph& graph, size_t node_id) {
                           {
-                              visitor(node_id, [] {})
+                              visitor(graph, node_id, [](const auto& /*neighbors*/) {})
                               } -> std::same_as<void>;
                       };
 
@@ -163,7 +201,7 @@ template <
     typename Initializer,
     typename Builder,
     GreedySearchTracker<typename Graph::index_type> Tracker,
-    NodeVisitor Visitor = VisitOnce>
+    NodeVisitor<Graph> Visitor = VisitOnce>
 void greedy_search(
     const Graph& graph,
     const Dataset& dataset,
@@ -176,7 +214,6 @@ void greedy_search(
     Tracker& search_tracker,
     GreedySearchPrefetchParameters prefetch_parameters = {},
     const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>()),
-    // May invoke the body repeatedly; side effects are not reverted between invocations.
     const Visitor& visit_node = {}
 ) {
     using I = typename Graph::index_type;
@@ -204,9 +241,8 @@ void greedy_search(
         const auto& node = search_buffer.next();
         auto node_id = node.id();
 
-        visit_node(node_id, [&] {
-            // Get the adjacency list for this vertex and prepare prefetching logic.
-            auto neighbors = graph.get_node(node_id);
+        visit_node(graph, node_id, [&](const auto& neighbors) {
+            // The visitor supplies the validated neighbor range.
             const size_t num_neighbors = neighbors.size();
             search_tracker.visited(Neighbor<I>{node}, neighbors.size());
 
@@ -261,7 +297,7 @@ template <
     typename Buffer,
     typename Initializer,
     typename Builder = NeighborBuilder,
-    NodeVisitor Visitor = VisitOnce>
+    NodeVisitor<Graph> Visitor = VisitOnce>
 void greedy_search(
     const Graph& graph,
     const Dataset& dataset,
