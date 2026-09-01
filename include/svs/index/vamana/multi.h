@@ -25,6 +25,18 @@
 
 namespace svs::index::vamana {
 
+namespace detail {
+/// Empty type for policies that do not track pending label deletes.
+struct NoLabelDeleteTracking {};
+
+/// Tag types for distinguishing mutex members under [[no_unique_address]].
+struct L2ETag {};
+struct E2LTag {};
+
+/// Mutex wrapper with tag type to enable distinct empty base optimization.
+template <typename M, typename Tag> struct TaggedMutex : M {};
+} // namespace detail
+
 /// @brief A multi-vector batch iterator for retrieving neighbors with unique labels from
 /// the index in batches.
 ///
@@ -193,18 +205,26 @@ class MultiMutableVamanaIndex {
         external_id_type,
         std::unique_ptr<std::atomic<external_id_type>>>;
 
+    // Pending delete tracker: stores label-to-external mapping under policies that
+    // support selective consolidation, empty type otherwise.
+    using pending_deletes_type = std::conditional_t<
+        Sync::tracks_pending_label_deletes,
+        label_to_external_type,
+        detail::NoLabelDeleteTracking>;
+
     distance_type distance_;
     counter_type counter_;
+    // Lock ordering: always acquire l2e_mutex_ before e2l_mutex_ to avoid deadlock.
+    [[no_unique_address]] detail::TaggedMutex<typename Sync::mutex_type, detail::L2ETag>
+        l2e_mutex_;
+    [[no_unique_address]] detail::TaggedMutex<typename Sync::mutex_type, detail::E2LTag>
+        e2l_mutex_;
     std::unique_ptr<ParentIndex> index_{nullptr};
     label_to_external_type label_to_external_;
     external_to_label_type external_to_label_;
-    // External IDs soft-deleted but not yet consolidated. Keyed by label for
-    // consolidate(labels) to recover them; the parent index erases translator
-    // entries only during consolidation. Guarded by l2e_mutex_.
-    label_to_external_type pending_deletes_;
-    // Lock ordering: always acquire l2e_mutex_ before e2l_mutex_ to avoid deadlock.
-    [[no_unique_address]] typename Sync::mutex_type l2e_mutex_;
-    [[no_unique_address]] typename Sync::mutex_type e2l_mutex_;
+    // External IDs soft-deleted but not yet consolidated, keyed by label. Guarded by
+    // l2e_mutex_. Empty under policies that do not support selective consolidation.
+    [[no_unique_address]] pending_deletes_type pending_deletes_;
 
     static constexpr counter_type init_counter() {
         if constexpr (std::is_same_v<typename Sync::mutex_type, lib::NullMutex>) {
@@ -451,10 +471,12 @@ class MultiMutableVamanaIndex {
                             external_to_label_.erase(ext);
                         }
                     }
-                    // Remember soft-deleted externals under their label so
-                    // consolidate(labels) can consolidate just these points.
-                    auto& pending = pending_deletes_[label];
-                    pending.insert(pending.end(), externals.begin(), externals.end());
+                    // Track pending deletes under policies supporting selective
+                    // consolidation.
+                    if constexpr (Sync::tracks_pending_label_deletes) {
+                        auto& pending = pending_deletes_[label];
+                        pending.insert(pending.end(), externals.begin(), externals.end());
+                    }
                     label_to_external_.erase(it);
                 }
             }
@@ -515,13 +537,17 @@ class MultiMutableVamanaIndex {
     void compact(Idx batch_size = 1'000) {
         index_->compact(batch_size);
         std::lock_guard l2e_lock{l2e_mutex_};
-        pending_deletes_.clear();
+        if constexpr (Sync::tracks_pending_label_deletes) {
+            pending_deletes_.clear();
+        }
     }
 
     void consolidate() {
         index_->consolidate();
         std::lock_guard l2e_lock{l2e_mutex_};
-        pending_deletes_.clear();
+        if constexpr (Sync::tracks_pending_label_deletes) {
+            pending_deletes_.clear();
+        }
     }
 
     // Consolidate only the soft-deleted vectors belonging to `labels`.
@@ -529,9 +555,12 @@ class MultiMutableVamanaIndex {
     // consolidate(). Returns the number of external vectors consolidated.
     template <typename T>
     size_t consolidate(const T& labels)
-        requires requires(ParentIndex& parent, std::vector<external_id_type>& e) {
-                     parent.consolidate(e);
-                 }
+        requires(
+            Sync::tracks_pending_label_deletes &&
+            requires(ParentIndex & parent, std::vector<external_id_type>& e) {
+                parent.consolidate(e);
+            }
+        )
     {
         std::vector<external_id_type> externals;
         {
@@ -780,16 +809,13 @@ class MultiMutableVamanaIndex {
     }
 };
 
-// Peak RSS excludes SVS hugepage allocations, so per-instance regressions are invisible
-// to runtime measurement. The [[no_unique_address]] mutexes are empty under
-// SequentialSync (asserted in sync_policy.h), but pending_deletes_ adds 56 bytes vs
-// main (136 bytes). Pin current size to prevent further growth.
+// Peak RSS excludes SVS hugepage allocations; pin size equal to main.
 static_assert(
     sizeof(MultiMutableVamanaIndex<
            graphs::SimpleBlockedGraph<uint32_t>,
            data::SimpleData<float>,
            distance::DistanceL2,
-           SequentialSync>) == 200 // main: 136 bytes, regression: +64 bytes
+           SequentialSync>) == 136
 );
 
 ///// Deduction Guides.

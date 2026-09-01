@@ -125,6 +125,7 @@ concept SyncPolicy = requires {
                          typename P::template container_type<int>;
                          requires SyncCounter<typename P::counter_type>;
                          { P::reserves_pending_slots } -> std::convertible_to<bool>;
+                         { P::tracks_pending_label_deletes } -> std::convertible_to<bool>;
                      };
 
 /// @brief A synchronization policy together with the graph type it will be used with.
@@ -146,6 +147,8 @@ struct SequentialSync {
 
     /// Reserved slots are immediately visible to search; there is no Pending state.
     static constexpr bool reserves_pending_slots = false;
+    /// Selective consolidation by label is not needed under sequential access.
+    static constexpr bool tracks_pending_label_deletes = false;
 };
 
 /// @brief Synchronization policy for concurrent readers with seqlock-protected adjacency.
@@ -164,6 +167,8 @@ struct SeqlockSync {
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
+    /// Selective consolidation requires tracking which labels have pending deletes.
+    static constexpr bool tracks_pending_label_deletes = true;
 };
 
 static_assert(SyncCounter<PlainCounter>);
