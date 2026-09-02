@@ -161,9 +161,8 @@ template <typename Idx> class BackedgeBuffer {
     }
 };
 
-// Default candidate-eligibility predicate: every id is eligible.
-// Alternative predicates admit `bool(Idx)` to exclude ids (e.g. deleted slots) from
-// entering the candidate pool without hiding them from graph traversal.
+// Default eligibility predicate: every id may enter the candidate pool. Alternatives
+// take `bool(Idx)` and exclude ids without hiding them from graph traversal.
 struct AllCandidatesValid {
     template <typename I> constexpr bool operator()(I) const { return true; }
 };

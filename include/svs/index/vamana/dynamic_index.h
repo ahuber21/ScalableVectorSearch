@@ -898,7 +898,7 @@ class MutableVamanaIndex {
             GreedySearchPrefetchParameters{sp.prefetch_lookahead_, sp.prefetch_step_};
         // Concurrent slots reach Empty only via consolidate(); admitting it wires edges
         // into removed slots. Sequential's own in-flight points stay Empty, so keep it.
-        auto not_deleted = [&](Idx i) {
+        auto eligible = [&](Idx i) {
             auto s = getindex(status_, i);
             if constexpr (Sync::reserves_pending_slots) {
                 return s == SlotMetadata::Valid || s == SlotMetadata::Pending;
@@ -914,7 +914,7 @@ class MutableVamanaIndex {
             threadpool_,
             vertex_locks_,
             node_visitor_type{},
-            not_deleted,
+            eligible,
             prefetch_parameters,
             logger_,
             logging::Level::Trace};

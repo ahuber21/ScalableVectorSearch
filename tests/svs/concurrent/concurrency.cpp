@@ -841,12 +841,8 @@ CATCH_TEST_CASE(
     CATCH_REQUIRE(recall > 0.85);
 }
 
-// VamanaBuilder's own greedy_search can select an already-Deleted node as a neighbor and
-// wire an edge to it. If consolidate() has already rerouted that node's in-edges, the new
-// edge survives consolidate() and only surfaces later, when compact() removes the slot.
-// Unlike the "compact during mutation" test above, deletions are *not* reclaimed
-// quiescently first -- add_points and consolidate() run genuinely concurrently, which is
-// the combination this test exists to exercise.
+// VamanaBuilder can wire an edge to an already-Deleted node; it survives consolidate() and
+// only throws later in compact(). Unlike "compact during mutation", no quiescent reclaim.
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex add_points during consolidate", "[concurrent]"
 ) {
