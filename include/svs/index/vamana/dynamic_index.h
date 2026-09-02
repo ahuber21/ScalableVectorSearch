@@ -799,6 +799,9 @@ class MutableVamanaIndex {
     std::vector<size_t> add_points(
         const Points& points, const ExternalIds& external_ids, bool reuse_empty = false
     ) {
+        // Excludes concurrent compact(), which renumbers slots this indexes into.
+        // Must precede slot_alloc_mutex_/translator_mutex_ per the lock order above.
+        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
         const size_t num_points = points.size();
         const size_t num_ids = external_ids.size();
         if (num_points != num_ids) {
@@ -1178,6 +1181,8 @@ class MutableVamanaIndex {
 
     ///// Mutation
     void consolidate() {
+        // Excludes concurrent compact(); consolidate() takes no other index-level mutex.
+        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
         auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
         std::function<bool(size_t)> valid = [&](size_t i) { return this->is_live(i); };
 
