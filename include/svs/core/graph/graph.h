@@ -22,10 +22,10 @@
 #include "svs/lib/boundscheck.h"
 #include "svs/lib/concurrency/atomic_span.h"
 #include "svs/lib/concurrency/seqlock.h"
-#include "svs/lib/relocatable_spinlock.h"
 #include "svs/lib/reverse_edges.h"
 #include "svs/lib/saveload.h"
 #include "svs/lib/segmented_vector.h"
+#include "svs/lib/spinlock.h"
 
 #include <atomic>
 #include <cassert>
@@ -56,7 +56,7 @@ struct PlainAccess {
 struct SeqlockAccess {
     struct state_type {
         SeqLockArray seq_counters;
-        lib::SegmentedVector<RelocatableSpinLock> node_locks;
+        lib::SegmentedVector<SpinLock> node_locks;
 
         void resize(size_t n) {
             seq_counters.resize(n);
@@ -150,11 +150,9 @@ class SimpleGraphBase {
         // Store sequence value at full width to prevent truncation-induced wrap that
         // allows read_validate to falsely accept a torn read.
         svs::SeqLockCounter::counter_type seq_;
-        [[no_unique_address]] std::conditional_t<
-            std::same_as<Access, SeqlockAccess>,
-            RelocatableSpinLock*,
-            std::monostate>
-            lock_;
+        [[no_unique_address]] std::
+            conditional_t<std::same_as<Access, SeqlockAccess>, SpinLock*, std::monostate>
+                lock_;
     };
 
     ///

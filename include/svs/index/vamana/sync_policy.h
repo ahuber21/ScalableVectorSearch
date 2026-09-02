@@ -23,7 +23,6 @@
 #include "svs/lib/concurrency/atomic_value.h"
 #include "svs/lib/movable_mutex.h"
 #include "svs/lib/null_mutex.h"
-#include "svs/lib/relocatable_spinlock.h"
 #include "svs/lib/segmented_vector.h"
 #include "svs/lib/spinlock.h"
 
@@ -176,7 +175,7 @@ struct SeqlockSync {
     using counter_type = AtomicCounter;
     using graph_access_type = graphs::SeqlockAccess;
     using growth_type = data::SegmentStable;
-    using vertex_locks_type = lib::SegmentedVector<RelocatableSpinLock>;
+    using vertex_locks_type = lib::SegmentedVector<SpinLock>;
 
     using node_visitor_type = SeqlockVisitor;
     // Lock-free readers (greedy_search inside ValidBuilder) access this container while

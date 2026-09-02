@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "svs/lib/relocatable_spinlock.h"
 #include "svs/lib/segmented_vector.h"
+#include "svs/lib/spinlock.h"
 
 // external
 #include "tsl/robin_set.h"
@@ -54,7 +54,7 @@ static_assert(
 /// @brief Per-node index of in-neighbors: `R(n)` is the list of nodes that point at `n`.
 ///
 /// Stored as one `std::vector<Idx>` per node, indexed by node id in a grow-stable
-/// `SegmentedVector`, with a per-node `RelocatableSpinLock`. Every operation touches only
+/// `SegmentedVector`, with a per-node `SpinLock`. Every operation touches only
 /// the target node's list under its own lock.
 ///
 /// `R(n)` is a complete superset of `n`'s in-neighbors: `record` is called unconditionally
@@ -144,7 +144,7 @@ template <std::unsigned_integral Idx> class ReverseEdges {
 
   private:
     lib::SegmentedVector<std::vector<Idx>> lists_;
-    mutable lib::SegmentedVector<RelocatableSpinLock> locks_;
+    mutable lib::SegmentedVector<SpinLock> locks_;
     std::atomic<bool> recording_{true};
 };
 

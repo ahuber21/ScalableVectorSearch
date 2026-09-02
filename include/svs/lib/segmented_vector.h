@@ -140,10 +140,10 @@ template <typename T> class SegmentedVector {
 
     /// @brief Grow or shrink the logical size. New elements are default-constructed.
     /// Single-writer; concurrent readers safe on grow (see class contract).
-    void resize(size_type n) { resize_impl_(n, nullptr); }
+    void resize(size_type n) { resize_impl_<false>(n, nullptr); }
 
     /// @brief Grow or shrink the logical size, filling new elements with ``fill``.
-    void resize(size_type n, const T& fill) { resize_impl_(n, &fill); }
+    void resize(size_type n, const T& fill) { resize_impl_<true>(n, &fill); }
 
     /// @brief Append one element, move-*constructing* it into the new slot.
     ///
@@ -227,16 +227,18 @@ template <typename T> class SegmentedVector {
         return bucket;
     }
 
-    // Construct elements [from, to) in place (single-writer). ``fill`` is nullptr for
-    // default-construction. Allocates buckets as needed.
+    // Construct elements [from, to) in place (single-writer). Allocates buckets as needed.
+    // Fill selects the branch at compile time: a runtime check here would make both
+    // branches compile for every T, requiring copy-constructibility even for resize(n).
+    template <bool Fill>
     void construct_range_(size_type from, size_type to, const T* fill) {
         for (size_type i = from; i < to; ++i) {
             auto [b, off] = locate_(i);
             T* bucket = ensure_bucket_(b);
-            if (fill == nullptr) {
-                new (&bucket[off]) T();
-            } else {
+            if constexpr (Fill) {
                 new (&bucket[off]) T(*fill);
+            } else {
+                new (&bucket[off]) T();
             }
         }
     }
@@ -249,7 +251,7 @@ template <typename T> class SegmentedVector {
         }
     }
 
-    void resize_impl_(size_type n, const T* fill) {
+    template <bool Fill> void resize_impl_(size_type n, const T* fill) {
         size_type old = size_.load(std::memory_order_relaxed);
         if (n == old) {
             return;
@@ -263,7 +265,7 @@ template <typename T> class SegmentedVector {
         }
         // Grow: construct the new elements, then publish the new size last so a reader
         // that observes it sees fully-constructed elements in published buckets.
-        construct_range_(old, n, fill);
+        construct_range_<Fill>(old, n, fill);
         size_.store(n, std::memory_order_release);
     }
 
