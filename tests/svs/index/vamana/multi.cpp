@@ -486,6 +486,18 @@ CATCH_TEST_CASE("Multi: Sync policy compile-time routing", "[index][vamana][mult
                 MutableVamanaIndex<Graph, Data, Distance, svs::index::vamana::SeqlockSync>>,
         "Parent index must be instantiated with SeqlockSync"
     );
+
+    // Verify TaggedMutex types are distinct under SeqlockSync.
+    using L2EMutex = svs::index::vamana::detail::TaggedMutex<
+        typename svs::index::vamana::SeqlockSync::mutex_type,
+        svs::index::vamana::detail::L2ETag>;
+    using E2LMutex = svs::index::vamana::detail::TaggedMutex<
+        typename svs::index::vamana::SeqlockSync::mutex_type,
+        svs::index::vamana::detail::E2LTag>;
+    static_assert(
+        !std::is_same_v<L2EMutex, E2LMutex>,
+        "TaggedMutex types must be distinct to prevent mutex collapse"
+    );
 }
 
 CATCH_TEST_CASE(

@@ -1550,6 +1550,16 @@ class MutableVamanaIndex {
     }
 };
 
+// Peak RSS excludes SVS hugepage allocations, so per-slot regressions are invisible
+// to runtime measurement. The sequential policy must not wrap the status element.
+static_assert(
+    sizeof(MutableVamanaIndex<
+           graphs::SimpleBlockedGraph<uint32_t>,
+           data::SimpleData<float>,
+           distance::DistanceL2,
+           SequentialSync>::status_type::value_type) == 1 // baseline: 1 byte
+);
+
 ///// Deduction Guides.
 // Guide for building.
 template <typename Data, typename Dist, typename ExternalIds>

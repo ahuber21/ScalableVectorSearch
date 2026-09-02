@@ -20,6 +20,7 @@
 #include "svs/lib/datatype.h"
 
 #include "svs/index/vamana/dynamic_index.h"
+#include "svs/index/vamana/multi.h"
 #include "svs/index/vamana/sync_policy.h"
 
 // catch2
@@ -83,6 +84,7 @@ struct BadVisitor {
     using node_visitor_type = int;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
+    static constexpr bool tracks_pending_label_deletes = false;
 };
 static_assert(vamana::SyncPolicy<BadVisitor>);
 static_assert(!vamana::SyncPolicyFor<BadVisitor, TestGraph>);
@@ -115,6 +117,22 @@ static_assert(sizeof(AcceptedSequential) > 0);
 
 // Rejected: SeqlockSync over non-grow-stable dataset, a static_assert failure that cannot
 // be exercised from a translation unit that must compile.
+
+// Pins whole-index footprint against main@c57d2ad7, which measures 504 and 136. Peak RSS
+// cannot detect growth here: VmHWM excludes the hugetlb pages holding datasets and graphs.
+using SizedIndex = vamana::MutableVamanaIndex<
+    TestGraph,
+    svs::data::SimpleData<float>,
+    svs::distance::DistanceL2,
+    vamana::SequentialSync>;
+static_assert(sizeof(SizedIndex) == 504);
+
+using SizedMultiIndex = vamana::MultiMutableVamanaIndex<
+    TestGraph,
+    svs::data::SimpleData<float>,
+    svs::distance::DistanceL2,
+    vamana::SequentialSync>;
+static_assert(sizeof(SizedMultiIndex) == 136);
 
 // The whole point of NullMutex is that a member costs nothing.
 struct WithNullMutex {

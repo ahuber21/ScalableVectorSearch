@@ -126,6 +126,7 @@ concept SyncPolicy = requires {
                          typename P::template container_type<int>;
                          requires SyncCounter<typename P::counter_type>;
                          { P::reserves_pending_slots } -> std::convertible_to<bool>;
+                         { P::tracks_pending_label_deletes } -> std::convertible_to<bool>;
                      };
 
 /// @brief A synchronization policy together with the graph type it will be used with.
@@ -164,6 +165,9 @@ struct SequentialSync {
 
     /// Sequential builds own a transient lock array; no steady-state footprint.
     static constexpr bool has_vertex_locks = false;
+
+    /// Selective consolidation by label is not needed under sequential access.
+    static constexpr bool tracks_pending_label_deletes = false;
 };
 
 /// @brief Synchronization policy for concurrent readers with seqlock-protected adjacency.
@@ -186,6 +190,9 @@ struct SeqlockSync {
 
     /// Concurrent index owns a grow-stable lock array that lives as long as the graph.
     static constexpr bool has_vertex_locks = true;
+
+    /// Selective consolidation requires tracking which labels have pending deletes.
+    static constexpr bool tracks_pending_label_deletes = true;
 };
 
 static_assert(SyncCounter<PlainCounter>);
@@ -208,8 +215,12 @@ static_assert(std::is_move_assignable_v<SequentialSync::mutex_type>);
 static_assert(std::is_move_constructible_v<SeqlockSync::mutex_type>);
 static_assert(std::is_move_assignable_v<SeqlockSync::mutex_type>);
 
-// The sequential policy's mutex must remain empty for zero overhead.
+// Peak RSS excludes SVS hugepage allocations, so per-element regressions smaller than
+// 1 GiB are invisible to runtime measurement. The sequential policy must remain
+// byte-identical to the unparameterized index to prevent silent memory growth.
 static_assert(std::is_empty_v<SequentialSync::mutex_type>);
+static_assert(sizeof(PlainCounter) == sizeof(size_t));
+static_assert(sizeof(SequentialSync::container_type<int>::value_type) == sizeof(int));
 
 // A mutex must not be silently copyable.
 static_assert(!std::is_copy_constructible_v<SeqlockSync::mutex_type>);

@@ -76,6 +76,10 @@ struct SeqlockAccess {
     template <typename Idx> using reverse_edges_type = lib::ReverseEdges<Idx>;
 };
 
+// Peak RSS excludes SVS hugepage allocations, so per-node regressions are invisible
+// to runtime measurement. PlainAccess must add no per-node storage.
+static_assert(std::is_empty_v<PlainAccess::state_type>);
+
 //
 // We rely on an implicit layout for the graphs where length is stored inline with the
 // adjacency list like:
