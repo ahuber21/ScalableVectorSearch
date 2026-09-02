@@ -215,12 +215,6 @@ class VamanaBuilder {
             params.window_size,
             params.use_full_search_history
         );
-        // Check class invariants.
-        if (graph_.n_nodes() != data_.size()) {
-            throw ANNEXCEPTION(
-                "Expected graph to be pre-allocated with {} vertices!", data_.size()
-            );
-        }
     }
 
     void construct(
@@ -242,6 +236,25 @@ class VamanaBuilder {
         logging::Level level = logging::Level::Trace,
         logging::logger_ptr logger = svs::logging::get()
     ) {
+        // graph_ and data_ only ever grow, so this bound is valid without
+        // re-taking the allocator lock the caller already released.
+        const size_t limit = std::min(graph_.n_nodes(), data_.size());
+        auto require_in_range = [&](size_t id) {
+            if (id >= limit) {
+                throw ANNEXCEPTION(
+                    "Vamana builder id {} exceeds preallocated storage: graph has {} "
+                    "nodes, data has {} entries!",
+                    id,
+                    graph_.n_nodes(),
+                    data_.size()
+                );
+            }
+        };
+        require_in_range(lib::narrow_cast<size_t>(entry_point));
+        for (const auto& id : range) {
+            require_in_range(lib::narrow_cast<size_t>(id));
+        }
+
         size_t num_nodes = range.size();
         size_t num_batches = std::max(
             size_t{40}, lib::div_round_up(num_nodes, lib::narrow_cast<size_t>(64 * 64))
