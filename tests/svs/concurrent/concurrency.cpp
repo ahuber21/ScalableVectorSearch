@@ -683,3 +683,160 @@ CATCH_TEST_CASE("Report MutableVamanaIndex footprint", "[.][footprint]") {
     CATCH_INFO("sizeof(MutableVamanaIndex<SequentialSync>)=" << sizeof(Index));
     CATCH_REQUIRE(true);
 }
+
+// AR-20 excludes add_points()/consolidate() from compact() via compact_mutex_; without it,
+// compact() can resize data_/graph_ underneath an in-flight add_points.
+CATCH_TEST_CASE(
+    "Concurrent MutableVamanaIndex compact during mutation", "[concurrent][index]"
+) {
+    auto envnum = [](const char* name, size_t fallback) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : fallback;
+    };
+    const size_t local_initial = envnum("SVS_CMP_INITIAL", 200);
+    const size_t local_incremental = envnum("SVS_CMP_INCR", 10);
+    const size_t local_queries = envnum("SVS_CMP_QUERIES", 10);
+    const size_t local_writers = envnum("SVS_CMP_WRITERS", 1);
+    const int local_searchers = static_cast<int>(envnum("SVS_CMP_SEARCHERS", 1));
+    const size_t local_compacts = envnum("SVS_CMP_COMPACTS", 2);
+    constexpr size_t local_batch = 10;
+
+    const size_t total = local_initial + local_incremental;
+    auto base = random_vectors(total, kDim, 2468);
+
+    std::vector<size_t> initial_ids(local_initial);
+    std::iota(initial_ids.begin(), initial_ids.end(), 0);
+    auto initial_slice = std::vector<float>(
+        base.begin(), base.begin() + static_cast<long>(local_initial * kDim)
+    );
+    auto index = build_index(initial_slice, kDim, initial_ids, kBuildThreads);
+
+    auto sp = index->get_search_parameters();
+    sp.buffer_config({100});
+    index->set_search_parameters(sp);
+
+    auto queries_raw = random_vectors(local_queries, kDim, 8642);
+    auto queries = make_dataset(queries_raw, kDim);
+
+    // Reclaim deleted slots once, before workers start: add_points can wire edges into
+    // Deleted nodes, so racing it against consolidate()/compact() risks an unrelated throw.
+    std::vector<size_t> to_delete;
+    for (size_t id = 0; id < local_initial; id += 4) {
+        to_delete.push_back(id);
+    }
+    index->delete_entries(to_delete);
+    index->consolidate();
+    index->compact();
+
+    std::atomic<size_t> writers_running{0};
+    std::atomic<size_t> compactor_running{0};
+    std::atomic<size_t> searches_completed{0};
+    std::atomic<size_t> compacts_completed{0};
+    std::atomic<size_t> exceptions{0};
+    // Guards exception_log; appended only from catch blocks below, read only after joins.
+    std::mutex exception_log_mutex;
+    std::vector<std::string> exception_log;
+
+    const size_t per_writer = local_incremental / local_writers;
+
+    auto writer = [&](size_t w) {
+        size_t offset = 0;
+        try {
+            const size_t begin = local_initial + w * per_writer;
+            for (; offset < per_writer; offset += local_batch) {
+                const size_t n = std::min(local_batch, per_writer - offset);
+                add_batch(*index, base, begin + offset, n);
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "writer " + std::to_string(w) + " offset=" + std::to_string(offset) + ": " +
+                e.what()
+            );
+        }
+        writers_running.fetch_sub(1);
+    };
+
+    // No further deletions occur, so each compact() below is an identity remap; it still
+    // races add_points growing data_/graph_ against a size snapshot taken at its own start.
+    auto compactor = [&] {
+        size_t c = 0;
+        try {
+            for (; c < local_compacts; ++c) {
+                index->compact();
+                compacts_completed.fetch_add(1, std::memory_order_relaxed);
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "compactor round=" + std::to_string(c) + ": " + e.what()
+            );
+        }
+        compactor_running.store(0);
+    };
+
+    auto searcher = [&] {
+        size_t q = 0;
+        try {
+            auto scratch = index->scratchspace();
+            while (writers_running.load(std::memory_order_relaxed) != 0 ||
+                   compactor_running.load(std::memory_order_relaxed) != 0) {
+                for (q = 0; q < local_queries; ++q) {
+                    auto query =
+                        std::span<const float>(queries_raw.data() + q * kDim, kDim);
+                    index->search(query, scratch);
+                    searches_completed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "searcher query=" + std::to_string(q) + " completed=" +
+                std::to_string(searches_completed.load(std::memory_order_relaxed)) + ": " +
+                e.what()
+            );
+        }
+    };
+
+    std::vector<std::thread> threads;
+    writers_running.store(local_writers);
+    compactor_running.store(1);
+    for (size_t w = 0; w < local_writers; ++w) {
+        threads.emplace_back(writer, w);
+    }
+    threads.emplace_back(compactor);
+    for (int i = 0; i < local_searchers; ++i) {
+        threads.emplace_back(searcher);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    CATCH_INFO("searches completed: " << searches_completed.load());
+    CATCH_INFO("compact rounds completed: " << compacts_completed.load());
+    // No lock needed: all threads that could append are joined above.
+    std::string exception_report;
+    for (const auto& msg : exception_log) {
+        exception_report += msg + "; ";
+    }
+    CATCH_INFO("captured exceptions: " << exception_report);
+    CATCH_REQUIRE(exceptions.load() == 0);
+    CATCH_REQUIRE(searches_completed.load() > 0);
+    CATCH_REQUIRE(compacts_completed.load() > 0);
+
+    // Post-mutation the index must still be a correct index.
+    index->debug_check_invariants(true);
+    std::unordered_set<size_t> live;
+    index->on_ids([&live](size_t id) { live.insert(id); });
+    CATCH_REQUIRE(live.size() == index->size());
+
+    auto truth = ground_truth(base, live, queries_raw, kDim, kNumNeighbors);
+    auto results = svs::QueryResult<size_t>{local_queries, kNumNeighbors};
+    index->search(results.view(), queries, index->get_search_parameters());
+    const double recall = recall_at_k(results, truth);
+    CATCH_INFO("post-compact recall@" << kNumNeighbors << " = " << recall);
+    CATCH_REQUIRE(recall > 0.85);
+}
