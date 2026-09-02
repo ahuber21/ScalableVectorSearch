@@ -166,7 +166,8 @@ template <
     data::ImmutableMemoryDataset Data,
     typename Dist,
     threads::ThreadPool Pool,
-    typename Locks>
+    typename Locks,
+    typename NodeVisitor>
 class VamanaBuilder {
   public:
     // Type Aliases
@@ -186,6 +187,7 @@ class VamanaBuilder {
         const VamanaBuildParameters& params,
         Pool& threadpool,
         Locks& vertex_locks,
+        NodeVisitor node_visitor,
         GreedySearchPrefetchParameters prefetch_hint = {},
         svs::logging::logger_ptr logger = svs::logging::get(),
         logging::Level level = logging::Level::Debug
@@ -197,6 +199,7 @@ class VamanaBuilder {
         , prefetch_hint_{prefetch_hint}
         , threadpool_{threadpool}
         , vertex_locks_{vertex_locks}
+        , node_visitor_{node_visitor}
         , backedge_buffer_{data.size(), 1000} {
         // Print all parameters
         svs::logging::log(
@@ -385,7 +388,7 @@ class VamanaBuilder {
                             tracker,
                             prefetch_hint_,
                             lib::Returns(lib::Const<false>()),
-                            VisitOnce{}
+                            node_visitor_
                         );
                     }
 
@@ -621,6 +624,10 @@ class VamanaBuilder {
     // Under SequentialSync: transient function-local array. Under SeqlockSync: index member
     // grown inside slot_alloc_mutex_ alongside the graph, so every reachable id has a lock.
     Locks& vertex_locks_;
+    // Node visitor for the builder's own greedy_search; caller passes
+    // Sync::node_visitor_type so a concurrent reader retries on a torn adjacency list
+    // instead of accepting it.
+    [[no_unique_address]] NodeVisitor node_visitor_;
     /// Overflow backedge buffer.
     BackedgeBuffer<Idx> backedge_buffer_;
 };

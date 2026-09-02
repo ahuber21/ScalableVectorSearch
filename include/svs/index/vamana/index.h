@@ -439,6 +439,7 @@ class VamanaIndex {
             build_parameters_,
             threadpool_,
             vertex_locks,
+            node_visitor_type{},
             extensions::estimate_prefetch_parameters(data_),
             logger
         );

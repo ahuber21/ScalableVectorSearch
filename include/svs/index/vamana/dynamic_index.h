@@ -303,6 +303,7 @@ class MutableVamanaIndex {
             build_parameters_,
             threadpool_,
             vertex_locks_,
+            node_visitor_type{},
             prefetch_parameters,
             logger_
         );
@@ -898,6 +899,7 @@ class MutableVamanaIndex {
             parameters,
             threadpool_,
             vertex_locks_,
+            node_visitor_type{},
             prefetch_parameters,
             logger_,
             logging::Level::Trace};
