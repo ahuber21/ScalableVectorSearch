@@ -51,9 +51,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <span>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -276,13 +278,17 @@ CATCH_TEST_CASE(
     std::atomic<size_t> bad_roundtrips{0};
     std::atomic<size_t> duplicate_ids{0};
     std::atomic<size_t> exceptions{0};
+    // Guards exception_log; appended only from catch blocks below, read only after joins.
+    std::mutex exception_log_mutex;
+    std::vector<std::string> exception_log;
 
     const size_t per_writer = local_incremental / local_writers;
 
     auto writer = [&](size_t w) {
+        size_t offset = 0;
         try {
             const size_t begin = local_initial + w * per_writer;
-            for (size_t offset = 0; offset < per_writer; offset += local_batch) {
+            for (; offset < per_writer; offset += local_batch) {
                 const size_t n = std::min(local_batch, per_writer - offset);
                 add_batch(*index, base, begin + offset, n);
 
@@ -302,17 +308,23 @@ CATCH_TEST_CASE(
             }
         } catch (const std::exception& e) {
             exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "writer " + std::to_string(w) + " offset=" + std::to_string(offset) + ": " +
+                e.what()
+            );
         }
         writers_running.fetch_sub(1);
     };
 
     // Searchers: hammer the index with single-query searches throughout.
     auto searcher = [&] {
+        size_t q = 0;
         try {
             auto scratch = index->scratchspace();
             std::unordered_set<Idx> seen_ids;
             while (writers_running.load(std::memory_order_relaxed) != 0) {
-                for (size_t q = 0; q < local_queries; ++q) {
+                for (q = 0; q < local_queries; ++q) {
                     auto query =
                         std::span<const float>(queries_raw.data() + q * kDim, kDim);
                     index->search(query, scratch);
@@ -350,6 +362,12 @@ CATCH_TEST_CASE(
             }
         } catch (const std::exception& e) {
             exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "searcher query=" + std::to_string(q) + " completed=" +
+                std::to_string(searches_completed.load(std::memory_order_relaxed)) + ": " +
+                e.what()
+            );
         }
     };
 
@@ -366,6 +384,12 @@ CATCH_TEST_CASE(
     }
 
     CATCH_INFO("searches completed: " << searches_completed.load());
+    // No lock needed: all threads that could append are joined above.
+    std::string exception_report;
+    for (const auto& msg : exception_log) {
+        exception_report += msg + "; ";
+    }
+    CATCH_INFO("captured exceptions: " << exception_report);
     CATCH_REQUIRE(exceptions.load() == 0);
     CATCH_REQUIRE(bad_roundtrips.load() == 0);
     CATCH_REQUIRE(duplicate_ids.load() == 0);
