@@ -440,6 +440,7 @@ class VamanaIndex {
             threadpool_,
             vertex_locks,
             node_visitor_type{},
+            AllCandidatesValid{},
             extensions::estimate_prefetch_parameters(data_),
             logger
         );
