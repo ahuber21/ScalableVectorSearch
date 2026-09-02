@@ -49,10 +49,11 @@ exposing each seam as its own template parameter. `SyncPolicy` (`sync_policy.h`)
   pending deletes, which selective consolidation by label needs and sequential access does not.
 
 `SyncPolicyFor<P, Graph>` additionally requires `P::node_visitor_type` to satisfy `NodeVisitor`
-for that graph type (see below). Two more members, `vertex_locks_type` and `has_vertex_locks`,
-exist on both concrete policies and are used directly by `dynamic_index.h`, but neither is part
-of the `SyncPolicy` concept's `requires`-clause — a future policy that omits them fails at the
-use site in `dynamic_index.h` rather than at the concept check.
+for that graph type (see below). One more member, `vertex_locks_type`, exists on both concrete
+policies and is used directly by `dynamic_index.h` — but it is deliberately **not** part of the
+`SyncPolicy` concept's `requires`-clause, because the concept's negative tests in
+`tests/svs/index/vamana/sync_policy.cpp` construct policies without it. A future policy that omits
+it fails at the use site in `dynamic_index.h` rather than at the concept check.
 
 `SequentialSync` sets every member to exactly the type the index used before it was
 parameterized: `lib::NullMutex`, `PlainCounter`, `graphs::PlainAccess`, `data::Reallocating`,

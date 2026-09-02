@@ -163,9 +163,6 @@ struct SequentialSync {
     /// Reserved slots are immediately visible to search; there is no Pending state.
     static constexpr bool reserves_pending_slots = false;
 
-    /// Sequential builds own a transient lock array; no steady-state footprint.
-    static constexpr bool has_vertex_locks = false;
-
     /// Selective consolidation by label is not needed under sequential access.
     static constexpr bool tracks_pending_label_deletes = false;
 };
@@ -187,9 +184,6 @@ struct SeqlockSync {
     template <typename T> using container_type = lib::SegmentedVector<lib::AtomicValue<T>>;
 
     static constexpr bool reserves_pending_slots = true;
-
-    /// Concurrent index owns a grow-stable lock array that lives as long as the graph.
-    static constexpr bool has_vertex_locks = true;
 
     /// Selective consolidation requires tracking which labels have pending deletes.
     static constexpr bool tracks_pending_label_deletes = true;
