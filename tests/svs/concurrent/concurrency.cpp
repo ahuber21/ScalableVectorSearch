@@ -856,8 +856,8 @@ CATCH_TEST_CASE(
     };
     const size_t local_initial = envnum("SVS_ADC_INITIAL", 500);
     const size_t local_incremental = envnum("SVS_ADC_INCR", 200);
-    const size_t local_batch = envnum("SVS_ADC_BATCH", 25);
-    const size_t local_rounds = envnum("SVS_ADC_ROUNDS", 8);
+    const size_t local_batch = envnum("SVS_ADC_BATCH", 5);
+    const size_t local_rounds = envnum("SVS_ADC_ROUNDS", 40);
     const size_t local_queries = envnum("SVS_ADC_QUERIES", 10);
 
     const size_t total = local_initial + local_incremental;
