@@ -1223,10 +1223,13 @@ class MutableVamanaIndex {
             check_is_deleted
         );
 
-        // After consolidation - set all `Deleted` slots to `Empty`.
-        for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
-            if (status_[i] == SlotMetadata::Deleted) {
-                status_[i] = SlotMetadata::Empty;
+        // Freeing a Deleted slot here can race a concurrent add_points that already read
+        // it eligible; skip under the concurrent policy, no slot reuse until compact().
+        if constexpr (!Sync::reserves_pending_slots) {
+            for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
+                if (status_[i] == SlotMetadata::Deleted) {
+                    status_[i] = SlotMetadata::Empty;
+                }
             }
         }
     }
