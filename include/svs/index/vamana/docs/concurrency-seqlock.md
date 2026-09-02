@@ -45,6 +45,8 @@ exposing each seam as its own template parameter. `SyncPolicy` (`sync_policy.h`)
 - `container_type<T>` — the slot-metadata container template.
 - `reserves_pending_slots` — a `bool` selecting whether a reserved slot is visible to search
   before it is fully built (see `SlotMetadata::Pending`).
+- `tracks_pending_label_deletes` — a `bool` selecting whether the index records which labels have
+  pending deletes, which selective consolidation by label needs and sequential access does not.
 
 `SyncPolicyFor<P, Graph>` additionally requires `P::node_visitor_type` to satisfy `NodeVisitor`
 for that graph type (see below). Two more members, `vertex_locks_type` and `has_vertex_locks`,
@@ -54,7 +56,8 @@ use site in `dynamic_index.h` rather than at the concept check.
 
 `SequentialSync` sets every member to exactly the type the index used before it was
 parameterized: `lib::NullMutex`, `PlainCounter`, `graphs::PlainAccess`, `data::Reallocating`,
-`std::vector<T>`, `VisitOnce`, `EmptyLockArray`, `reserves_pending_slots = false`. Because the
+`std::vector<T>`, `VisitOnce`, `EmptyLockArray`, `reserves_pending_slots = false`,
+`tracks_pending_label_deletes = false`. Because the
 default template argument is `SequentialSync`, `MutableVamanaIndex<G, D, Dist>` still means
 exactly what it meant before this parameter existed, and every existing call site compiles
 unchanged. `static_assert`s in `sync_policy.cpp` pin this type mapping so a later edit cannot
@@ -63,7 +66,8 @@ empty (`std::is_empty_v`) so the default path carries no mutex at all.
 
 `SeqlockSync` selects `lib::MovableMutex<std::shared_mutex>`, `AtomicCounter`,
 `graphs::SeqlockAccess`, `data::SegmentStable`, `lib::SegmentedVector<lib::AtomicValue<T>>`,
-`SeqlockVisitor`, `lib::SegmentedVector<SpinLock>`, and `reserves_pending_slots = true`.
+`SeqlockVisitor`, `lib::SegmentedVector<SpinLock>`, `reserves_pending_slots = true` and
+`tracks_pending_label_deletes = true`.
 
 The alternative this design avoids is a second, parallel implementation of the index in a
 separate namespace, selected by which types are duplicated rather than by which types a single
@@ -94,6 +98,11 @@ that maintains this invariant: under `SeqlockAccess` it takes the per-node `Spin
 and releases the lock on destruction; under `PlainAccess` it compiles to a no-op. Writer-writer
 exclusion on the same node is the caller's responsibility via that per-node lock — the counter
 alone only orders a single writer against concurrent readers.
+
+Every writer that installs an adjacency list on a live graph takes this guard immediately around
+its `replace_node` call: `VamanaBuilder` (`vamana_build.h`) and `GraphConsolidator::apply_updates`
+(`consolidate.h`). `compact()` is the one deliberate exception, and it substitutes exclusion for
+validation; see [What is not yet safe](#what-is-not-yet-safe).
 
 On the read side, `SeqlockVisitor` (`svs/index/vamana/greedy_search.h`) is the `NodeVisitor`
 `greedy_search` invokes at each expanded node under `SeqlockSync` (the default, `VisitOnce`, just
@@ -150,39 +159,50 @@ shared recursively can deadlock behind a writer that queued in between the two a
 lock order above is what keeps every acquisition path acyclic.
 
 `compact_mutex_` has exactly one exclusive (`std::unique_lock`) acquisition in the whole class,
-inside `compact()`; every other acquisition anywhere in the class — the single-query and batch
-`search()` overloads, `exhaustive_search()`, and the shared-lock accessors `lock_for_search()`
-and `lock_for_translation()` that `BatchIterator` uses — takes it with `std::shared_lock`. **A
-shared `compact_mutex_` lock on the search path therefore excludes `compact()` and nothing
-else.** In particular:
+inside `compact()`; every other acquisition anywhere in the class takes it with
+`std::shared_lock` — the single-query and batch `search()` overloads, `exhaustive_search()`, the
+shared-lock accessors `lock_for_search()` and `lock_for_translation()` that `BatchIterator` uses,
+and `add_points()` and `consolidate()`. **A shared `compact_mutex_` lock therefore excludes
+`compact()` and nothing else; `compact()`'s exclusive lock excludes every one of them.** In
+particular:
 
-- `add_points()` takes `slot_alloc_mutex_` and `translator_mutex_` only. It never touches
-  `compact_mutex_`, deliberately — concurrent insert during search is the capability this design
-  exists to deliver, and excluding it from `compact_mutex_` is what lets it proceed while a
-  search holds a shared lock.
-- `consolidate()` takes no index-level mutex at all. It is made safe to run alongside search
-  purely by the per-node `write_guard` inside the free `consolidate()` function it calls, not by
-  any lock declared on `MutableVamanaIndex`.
+- `add_points()` takes `compact_mutex_` shared as its first action, then `slot_alloc_mutex_` and
+  `translator_mutex_` in the documented order. The shared lock is what makes concurrent insert
+  during search — the capability this design exists to deliver — coexist with `compact()`, which
+  renumbers the very slots `add_points` indexes into and so cannot overlap it.
+- `consolidate()` takes `compact_mutex_` shared and no other index-level mutex. The per-node
+  `write_guard` inside the free `consolidate()` function it calls is what makes it safe against
+  concurrent *search*; the shared `compact_mutex_` is what makes it safe against `compact()`.
+  Those are two separate mechanisms covering two separate races — do not reason about either from
+  the other.
+
+`Sync::mutex_type` is not recursive, so neither `add_points()` nor `consolidate()` may be called
+from a context that already holds `compact_mutex_`. Nothing in the class does: the `save()`
+overloads take no `compact_mutex_` of their own and call `consolidate()` and `compact()`
+sequentially, so each acquisition is released before the next is taken. Adding the lock to a
+caller of either function would deadlock.
 
 ## What is not yet safe
 
-**`compact()`'s own graph write is unguarded.** `compact()` calls
-`graph_.replace_node(new_id, ...)` while holding an exclusive `compact_mutex_`, but it never
-calls `graph_.write_guard(new_id)`. That lock excludes `compact()` from concurrent *search*, but
-— as noted above — `add_points()` and `consolidate()` never take `compact_mutex_` at all, so
-nothing excludes either of them from running at the same time as `compact()`. This is an
-unenforced precondition rather than a live defect in the delivered capability: `compact()`
-shrinks and renumbers storage, so it cannot be concurrent with anything by construction, and the
-concurrency test suite's own comment contrasts `consolidate()` — "allowed to run while search
-continues" — with `compact()`, which is not exercised concurrently anywhere in that suite. Still,
-nothing states the precondition: there is no assertion and no doc comment on `compact()` itself,
-and every public wrapper around it is a plain pass-through.
+**`compact()`'s graph write substitutes exclusion for seqlock validation.** `compact()` calls
+`graph_.replace_node(new_id, ...)` while holding an exclusive `compact_mutex_` and never calls
+`graph_.write_guard(new_id)`, so the node's counter does not move and no reader's `read_validate`
+could detect the write. What makes that sound is the exclusive lock rather than the seqlock: every
+graph reader in the class — `search()`, `exhaustive_search()`, `BatchIterator` via
+`lock_for_search()`, `add_points()` and `consolidate()` — takes `compact_mutex_` shared, so none
+of them can run while `compact()` holds it exclusively.
 
-**`consolidate()`'s graph write is unguarded too.** `GraphConsolidator::apply_updates`
-(`consolidate.h`) calls `graph_.replace_node(...)` to install the rewired adjacency list for a
-node, with no `write_guard` anywhere in that file — unlike `VamanaBuilder`, which takes
-`graph_.write_guard(node_id)` immediately before each of its own `replace_node` calls. The
-consequence is the one stated above: a concurrent reader's `read_validate` cannot detect this
-write, and two unguarded writers to the same node are not mutually excluded by anything. Fixing
-this means adding the same guard `VamanaBuilder` already uses, taken per node around the existing
-update loop so nothing that can block is held across it; it is not yet done here.
+The precondition is therefore "every graph reader takes `compact_mutex_`", and **nothing enforces
+it.** A reader added later without that lock compiles, links and passes, and observes torn
+adjacency lists that the seqlock cannot report because `compact()` never bumps the counter. The
+cheaper of the two fixes is to take `graph_.write_guard(new_id)` in `compact()` as well, which
+costs an uncontended per-node lock on a path that is already exclusive and removes the reliance on
+a whole-class invariant; it is not done here.
+
+**The builder's adjacency reads are not all validated.** `VamanaBuilder` routes one
+`greedy_search` call through `node_visitor_` (`vamana_build.h`), but its remaining
+`graph_.get_node()` reads are plain, with no `read_begin`/`read_validate` pair. Under `SeqlockSync`
+a torn read there yields a garbage neighbour id; the always-on bounds check added alongside the
+`vertex_locks_` fix catches the subset that lands out of range, and a torn-but-in-range id
+silently installs a wrong edge that nothing detects. No observed failure has been traced to this,
+and it is not fixed here.
