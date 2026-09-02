@@ -83,6 +83,7 @@ struct BadVisitor {
     using node_visitor_type = int;
     template <typename T> using container_type = std::vector<T>;
     static constexpr bool reserves_pending_slots = false;
+    static constexpr bool tracks_pending_label_deletes = false;
 };
 static_assert(vamana::SyncPolicy<BadVisitor>);
 static_assert(!vamana::SyncPolicyFor<BadVisitor, TestGraph>);
