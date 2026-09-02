@@ -161,13 +161,20 @@ template <typename Idx> class BackedgeBuffer {
     }
 };
 
+// Default eligibility predicate: every id may enter the candidate pool. Alternatives
+// take `bool(Idx)` and exclude ids without hiding them from graph traversal.
+struct AllCandidatesValid {
+    template <typename I> constexpr bool operator()(I) const { return true; }
+};
+
 template <
     graphs::MemoryGraph Graph,
     data::ImmutableMemoryDataset Data,
     typename Dist,
     threads::ThreadPool Pool,
     typename Locks,
-    typename NodeVisitor>
+    typename NodeVisitor,
+    typename CandidateEligible>
 class VamanaBuilder {
   public:
     // Type Aliases
@@ -188,6 +195,7 @@ class VamanaBuilder {
         Pool& threadpool,
         Locks& vertex_locks,
         NodeVisitor node_visitor,
+        CandidateEligible candidate_eligible,
         GreedySearchPrefetchParameters prefetch_hint = {},
         svs::logging::logger_ptr logger = svs::logging::get(),
         logging::Level level = logging::Level::Debug
@@ -200,6 +208,7 @@ class VamanaBuilder {
         , threadpool_{threadpool}
         , vertex_locks_{vertex_locks}
         , node_visitor_{node_visitor}
+        , candidate_eligible_{candidate_eligible}
         , backedge_buffer_{data.size(), 1000} {
         // Print all parameters
         svs::logging::log(
@@ -430,12 +439,18 @@ class VamanaBuilder {
                     // Otherwise, pull results directly out of the search buffer.
                     if (tracker.enabled()) {
                         for (const auto& neighbor : tracker) {
+                            if (!candidate_eligible_(neighbor.id())) {
+                                continue;
+                            }
                             pool.push_back(modify_distance(neighbor));
                             visited.insert(neighbor.id());
                         }
                     } else {
                         for (size_t i = 0, imax = search_buffer.size(); i < imax; ++i) {
                             const auto& neighbor = search_buffer[i];
+                            if (!candidate_eligible_(neighbor.id())) {
+                                continue;
+                            }
                             pool.push_back(modify_distance(neighbor));
                             visited.insert(neighbor.id());
                         }
@@ -444,6 +459,9 @@ class VamanaBuilder {
                     // Add neighbors of the query that are not part of `visited`.
                     for (auto id : graph_.get_node(node_id)) {
                         assert(id != node_id);
+                        if (!candidate_eligible_(id)) {
+                            continue;
+                        }
                         // Try to emplace the node id into the visited set.
                         // If the id was inserted, then it didn't already exist in the
                         // visited set and we need to add it to the candidate pool.
@@ -641,6 +659,9 @@ class VamanaBuilder {
     // Sync::node_visitor_type so a concurrent reader retries on a torn adjacency list
     // instead of accepting it.
     [[no_unique_address]] NodeVisitor node_visitor_;
+    // Excludes ids from the candidate pool without hiding them from traversal, so a
+    // deleted node's edges still get followed but the node itself is never wired in.
+    [[no_unique_address]] CandidateEligible candidate_eligible_;
     /// Overflow backedge buffer.
     BackedgeBuffer<Idx> backedge_buffer_;
 };

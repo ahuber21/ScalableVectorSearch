@@ -840,3 +840,118 @@ CATCH_TEST_CASE(
     CATCH_INFO("post-compact recall@" << kNumNeighbors << " = " << recall);
     CATCH_REQUIRE(recall > 0.85);
 }
+
+// VamanaBuilder can wire an edge to an already-Deleted node; it survives consolidate() and
+// only throws later in compact(). Unlike "compact during mutation", no quiescent reclaim.
+CATCH_TEST_CASE(
+    "Concurrent MutableVamanaIndex add_points during consolidate", "[concurrent]"
+) {
+    auto envnum = [](const char* name, size_t fallback) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : fallback;
+    };
+    const size_t local_initial = envnum("SVS_ADC_INITIAL", 500);
+    const size_t local_incremental = envnum("SVS_ADC_INCR", 200);
+    const size_t local_batch = envnum("SVS_ADC_BATCH", 5);
+    const size_t local_rounds = envnum("SVS_ADC_ROUNDS", 40);
+    const size_t local_queries = envnum("SVS_ADC_QUERIES", 10);
+
+    const size_t total = local_initial + local_incremental;
+    auto base = random_vectors(total, kDim, 3691);
+
+    std::vector<size_t> initial_ids(local_initial);
+    std::iota(initial_ids.begin(), initial_ids.end(), 0);
+    auto initial_slice = std::vector<float>(
+        base.begin(), base.begin() + static_cast<long>(local_initial * kDim)
+    );
+    auto index = build_index(initial_slice, kDim, initial_ids, kBuildThreads);
+
+    auto sp = index->get_search_parameters();
+    sp.buffer_config({100});
+    index->set_search_parameters(sp);
+
+    auto queries_raw = random_vectors(local_queries, kDim, 1590);
+
+    std::atomic<size_t> exceptions{0};
+    // Guards exception_log; appended only from the two catch blocks below, read only
+    // after both threads have joined.
+    std::mutex exception_log_mutex;
+    std::vector<std::string> exception_log;
+    // Written only by the consolidator thread; read only after it joins.
+    std::unordered_set<size_t> deleted_ids;
+
+    auto inserter = [&] {
+        size_t offset = 0;
+        try {
+            for (; offset < local_incremental; offset += local_batch) {
+                const size_t n = std::min(local_batch, local_incremental - offset);
+                add_batch(*index, base, local_initial + offset, n);
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "inserter offset=" + std::to_string(offset) + ": " + e.what()
+            );
+        }
+    };
+
+    // Deletes a fresh residue class of original ids each round, then consolidates
+    // immediately, so its in-edge reroute for this round's ids can settle while the
+    // inserter above may still be wiring new edges into them.
+    auto deleter_consolidator = [&] {
+        size_t round = 0;
+        try {
+            for (; round < local_rounds; ++round) {
+                std::vector<size_t> to_delete;
+                for (size_t id = round; id < local_initial; id += 40) {
+                    to_delete.push_back(id);
+                    deleted_ids.insert(id);
+                }
+                index->delete_entries(to_delete);
+                index->consolidate();
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "consolidator round=" + std::to_string(round) + ": " + e.what()
+            );
+        }
+    };
+
+    std::thread inserter_thread(inserter);
+    std::thread consolidator_thread(deleter_consolidator);
+    inserter_thread.join();
+    consolidator_thread.join();
+
+    std::string exception_report;
+    for (const auto& msg : exception_log) {
+        exception_report += msg + "; ";
+    }
+    CATCH_INFO("captured exceptions: " << exception_report);
+    CATCH_REQUIRE(exceptions.load() == 0);
+
+    // Directly detects a valid node wired to a Deleted neighbor -- the corruption this
+    // test targets -- without needing compact() to turn it into a thrown exception.
+    std::string invariant_exception;
+    try {
+        index->debug_check_invariants(false);
+    } catch (const std::exception& e) { invariant_exception = e.what(); }
+    CATCH_INFO("debug_check_invariants(false): " << invariant_exception);
+    CATCH_REQUIRE(invariant_exception.empty());
+
+    // The production symptom: compact() removes a Deleted slot, and a stale edge into it
+    // (one consolidate() never got a chance to reroute) throws when compact() remaps it.
+    std::string compact_exception;
+    try {
+        index->compact();
+    } catch (const std::exception& e) { compact_exception = e.what(); }
+    CATCH_INFO("compact() exception: " << compact_exception);
+    CATCH_REQUIRE(compact_exception.empty());
+
+    std::unordered_set<size_t> live;
+    index->on_ids([&live](size_t id) { live.insert(id); });
+    CATCH_REQUIRE(live.size() == index->size());
+    CATCH_REQUIRE(live.size() == total - deleted_ids.size());
+}
