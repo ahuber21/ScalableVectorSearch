@@ -685,9 +685,8 @@ CATCH_TEST_CASE("Report MutableVamanaIndex footprint", "[.][footprint]") {
     CATCH_REQUIRE(true);
 }
 
-// AR-20 added a shared_lock on compact_mutex_ to add_points() and consolidate(), excluding
-// both from a concurrent compact(). Before that fix, compact()'s renumbering could resize
-// data_/graph_/status_ underneath an in-flight add_points or consolidate call.
+// AR-20 excludes add_points()/consolidate() from compact() via compact_mutex_; without it,
+// compact() can resize data_/graph_ underneath an in-flight add_points.
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex compact during mutation", "[concurrent][index]"
 ) {
@@ -720,14 +719,8 @@ CATCH_TEST_CASE(
     auto queries_raw = random_vectors(local_queries, kDim, 8642);
     auto queries = make_dataset(queries_raw, kDim);
 
-    // Delete a quarter of the initial points and reclaim them once, quiescently, before any
-    // worker starts. VamanaBuilder's neighbor search during add_points does not filter out
-    // Deleted nodes (vamana_build.h uses a plain NeighborBuilder, not the search path's
-    // deleted-aware ValidBuilder), so a concurrent add_points can wire a fresh edge into a
-    // Deleted node at any time; calling compact() without an immediately preceding
-    // consolidate() would then throw for a reason unrelated to AR-20. Reclaiming up front
-    // means the concurrent phase below never has a Deleted node for a race to expose --
-    // only the resize/renumber race AR-20 actually fixes remains observable.
+    // Reclaim deleted slots once, before workers start: add_points can wire edges into
+    // Deleted nodes, so racing it against consolidate()/compact() risks an unrelated throw.
     std::vector<size_t> to_delete;
     for (size_t id = 0; id < local_initial; id += 4) {
         to_delete.push_back(id);
@@ -766,9 +759,8 @@ CATCH_TEST_CASE(
         writers_running.fetch_sub(1);
     };
 
-    // No further deletions occur past this point, so every compact() call below is an
-    // identity remap; what it still races against is add_points growing data_/graph_ while
-    // compact() resizes them to a snapshot taken at the start of its own critical section.
+    // No further deletions occur, so each compact() below is an identity remap; it still
+    // races add_points growing data_/graph_ against a size snapshot taken at its own start.
     auto compactor = [&] {
         size_t c = 0;
         try {
