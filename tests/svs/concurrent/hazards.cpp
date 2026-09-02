@@ -26,9 +26,12 @@
 #include "svs/core/data.h"
 #include "svs/core/distance.h"
 #include "svs/lib/concurrency/seqlock.h"
+#include "svs/lib/misc.h"
 #include "svs/lib/threads.h"
 
 #include "catch2/catch_test_macros.hpp"
+
+#include "tests/utils/utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36,12 +39,14 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -172,33 +177,74 @@ CATCH_TEST_CASE("Failed insert leaves index usable", "[concurrent][hazards]") {
     );
     CATCH_REQUIRE(delete_ok);
 
-    // consolidate must succeed (if compiled; else no-op placeholder).
-    bool consolidate_ok = with_timeout([&] { completed_ops.fetch_add(1); }, timeout);
+    // consolidate must succeed and actually reroute edges away from the deleted slot.
+    bool consolidate_ok = with_timeout([&] { index->consolidate(); }, timeout);
     CATCH_REQUIRE(consolidate_ok);
+    completed_ops.fetch_add(1);
 
-    // save must succeed (omit actual filesystem I/O; check non-deadlock).
-    bool save_ok = with_timeout([&] { completed_ops.fetch_add(1); }, timeout);
+    // The survivor set is exact: the two inserts and the one delete above have a known
+    // outcome, so this is the point a stranded half-inserted slot would surface.
+    std::unordered_set<size_t> expected_survivors;
+    for (size_t i = 0; i < kInitialPoints - 1; ++i) {
+        expected_survivors.insert(i);
+    }
+    expected_survivors.insert(kInitialPoints + 100);
+
+    std::unordered_set<size_t> live_before_save;
+    index->on_ids([&](size_t id) { live_before_save.insert(id); });
+    CATCH_REQUIRE(live_before_save == expected_survivors);
+
+    // save must succeed and produce a reloadable index.
+    svs_test::prepare_temp_directory();
+    auto tmp = svs_test::temp_directory();
+    bool save_ok = with_timeout(
+        [&] { index->save(tmp / "config", tmp / "graph", tmp / "data"); }, timeout
+    );
     CATCH_REQUIRE(save_ok);
+    completed_ops.fetch_add(1);
 
-    // Search must succeed and return results (outside timeout to avoid lambda capture
-    // issues).
-    bool search_ok = true;
-    try {
-        auto queries_raw = random_vectors(10, kDim, 5555);
-        auto queries = svs::data::SimpleData<float>(10, kDim);
-        for (size_t i = 0; i < 10; ++i) {
-            queries.set_datum(
-                i, std::span<const float>(queries_raw.data() + i * kDim, kDim)
-            );
-        }
-        auto sp = index->get_search_parameters();
-        auto results = svs::QueryResult<size_t>{10, kNumNeighbors};
-        index->search(results.view(), queries, sp);
-        if (results.n_queries() > 0) {
-            completed_ops.fetch_add(1);
-        }
-    } catch (...) { search_ok = false; }
-    CATCH_REQUIRE(search_ok);
+    for (auto* name : {"config", "graph", "data"}) {
+        auto dir = tmp / name;
+        CATCH_REQUIRE(std::filesystem::exists(dir));
+        CATCH_REQUIRE(!std::filesystem::is_empty(dir));
+    }
+
+    // Reload under SequentialSync/PlainAccess for verification only: the on-disk format
+    // is policy-agnostic (dynamic_index.h's auto_dynamic_assemble), so the write-side
+    // SeqlockAccess graph type need not be reused to read it back.
+    using ReloadGraph = svs::graphs::SimpleBlockedGraph<Idx>;
+    using ReloadData = svs::data::SimpleData<float>;
+    auto graph_loader = SVS_LAZY(ReloadGraph::load(tmp / "graph"));
+    auto data_loader = SVS_LAZY(ReloadData::load(tmp / "data"));
+    auto reloaded = svs::index::vamana::auto_dynamic_assemble<
+        decltype(graph_loader),
+        decltype(data_loader),
+        Distance,
+        size_t,
+        svs::index::vamana::SequentialSync>(
+        tmp / "config",
+        std::move(graph_loader),
+        std::move(data_loader),
+        Distance(),
+        kBuildThreads
+    );
+    CATCH_REQUIRE(reloaded.size() == expected_survivors.size());
+
+    std::unordered_set<size_t> reloaded_survivors;
+    reloaded.on_ids([&](size_t id) { reloaded_survivors.insert(id); });
+    CATCH_REQUIRE(reloaded_survivors == expected_survivors);
+
+    // Search must succeed and return results for every query.
+    auto queries_raw = random_vectors(10, kDim, 5555);
+    auto queries = svs::data::SimpleData<float>(10, kDim);
+    for (size_t i = 0; i < 10; ++i) {
+        queries.set_datum(i, std::span<const float>(queries_raw.data() + i * kDim, kDim));
+    }
+    auto sp = index->get_search_parameters();
+    auto results = svs::QueryResult<size_t>{10, kNumNeighbors};
+    CATCH_REQUIRE_NOTHROW(index->search(results.view(), queries, sp));
+    CATCH_REQUIRE(results.n_queries() == 10);
+    completed_ops.fetch_add(1);
 
     CATCH_REQUIRE(completed_ops.load() == 5);
 }
