@@ -342,7 +342,14 @@ size_t find_medioid(
     });
 
     if (global_min.id() >= data.size()) {
-        global_min = Neighbor<size_t>(0, global_min.distance());
+        // A blind 0 can name a slot the predicate excluded (e.g. a deleted
+        // entry point), which later throws in MutableVamanaIndex::compact().
+        for (size_t i = 0, imax = data.size(); i < imax; ++i) {
+            if (predicate(i)) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     return global_min.id();
