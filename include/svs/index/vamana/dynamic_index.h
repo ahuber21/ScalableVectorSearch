@@ -896,11 +896,15 @@ class MutableVamanaIndex {
         auto sp = get_search_parameters();
         auto prefetch_parameters =
             GreedySearchPrefetchParameters{sp.prefetch_lookahead_, sp.prefetch_step_};
-        // Must admit Pending, not just Valid, regardless of reserves_pending_slots: this
-        // batch's own slots are Pending here, and excluding them would keep new points
-        // from linking to one another.
+        // Concurrent slots reach Empty only via consolidate(); admitting it wires edges
+        // into removed slots. Sequential's own in-flight points stay Empty, so keep it.
         auto not_deleted = [&](Idx i) {
-            return getindex(status_, i) != SlotMetadata::Deleted;
+            auto s = getindex(status_, i);
+            if constexpr (Sync::reserves_pending_slots) {
+                return s == SlotMetadata::Valid || s == SlotMetadata::Pending;
+            } else {
+                return s != SlotMetadata::Deleted;
+            }
         };
         VamanaBuilder builder{
             graph_,
