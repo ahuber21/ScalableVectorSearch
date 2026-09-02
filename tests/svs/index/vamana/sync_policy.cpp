@@ -118,9 +118,8 @@ static_assert(sizeof(AcceptedSequential) > 0);
 // Rejected: SeqlockSync over non-grow-stable dataset, a static_assert failure that cannot
 // be exercised from a translation unit that must compile.
 
-// Whole-index footprint pins: main@c57d2ad7 measures 504 and 136 for these types. Peak
-// RSS cannot catch growth here, since VmHWM excludes the hugetlb pages holding datasets
-// and graphs, so this is the only detector of an inflated index.
+// Pins whole-index footprint against main@c57d2ad7, which measures 504 and 136. Peak RSS
+// cannot detect growth here: VmHWM excludes the hugetlb pages holding datasets and graphs.
 using SizedIndex = vamana::MutableVamanaIndex<
     TestGraph,
     svs::data::SimpleData<float>,
