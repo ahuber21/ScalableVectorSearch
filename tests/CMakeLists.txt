@@ -154,6 +154,7 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/concurrent/concurrency.cpp
     ${TEST_DIR}/svs/concurrent/downstream.cpp
     ${TEST_DIR}/svs/concurrent/hazards.cpp
+    ${TEST_DIR}/svs/concurrent/persistence.cpp
     # Inverted
     ${TEST_DIR}/svs/index/inverted/clustering.cpp
     ${TEST_DIR}/svs/index/inverted/memory_based.cpp
