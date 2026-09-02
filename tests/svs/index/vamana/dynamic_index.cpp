@@ -24,6 +24,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -1109,4 +1110,57 @@ CATCH_TEST_CASE(
             static_assert(std::is_same_v<EP4_Result, svs::DynamicVamana>);
         }
     }
+}
+
+// Documents compact()'s adjacency-list remap throw at dynamic_index.h:1082 (wrapped
+// "Thread 0:" prefix), a pre-existing defect on upstream main; [!shouldfail] until fixed.
+CATCH_TEST_CASE(
+    "MutableVamanaIndex compact() after deleting every point",
+    "[graph_index][dynamic_index][!shouldfail]"
+) {
+    using Graph = svs::graphs::SimpleBlockedGraph<uint32_t>;
+    using Data = svs::data::SimpleData<float, svs::Dynamic>;
+    using Dist = svs::distance::DistanceL2;
+    using Index = svs::index::vamana::MutableVamanaIndex<Graph, Data, Dist>;
+
+    const size_t dim = 8;
+    const size_t initial = 20;
+    const size_t incremental = 5;
+
+    auto random_data = [&](size_t n, uint32_t seed) {
+        std::mt19937 rng{seed};
+        std::normal_distribution<float> dist{0.0f, 1.0f};
+        auto data = Data(n, dim);
+        std::vector<float> v(dim);
+        for (size_t i = 0; i < n; ++i) {
+            for (auto& x : v) {
+                x = dist(rng);
+            }
+            data.set_datum(i, v);
+        }
+        return data;
+    };
+
+    std::vector<size_t> initial_ids(initial);
+    std::iota(initial_ids.begin(), initial_ids.end(), 0);
+
+    auto parameters = svs::index::vamana::VamanaBuildParameters{1.2f, 4, 8, 16, 4, true};
+    auto index =
+        Index(parameters, random_data(initial, 42), initial_ids, Dist{}, size_t{1});
+
+    // Delete every point, then consolidate and add a few more: compact()'s adjacency-list
+    // remap then hits a stale edge into a Deleted neighbor, not the entry-point path below.
+    index.delete_entries(initial_ids);
+    index.consolidate();
+
+    std::vector<size_t> incremental_ids(incremental);
+    std::iota(incremental_ids.begin(), incremental_ids.end(), initial);
+    index.add_points(random_data(incremental, 99), incremental_ids);
+
+    std::string compact_exception;
+    try {
+        index.compact();
+    } catch (const std::exception& e) { compact_exception = e.what(); }
+    CATCH_INFO("compact() exception: " << compact_exception);
+    CATCH_REQUIRE(compact_exception.empty());
 }

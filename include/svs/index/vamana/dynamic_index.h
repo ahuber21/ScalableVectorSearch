@@ -1128,9 +1128,19 @@ class MutableVamanaIndex {
         }
         status_.resize(max_index);
 
-        // Update entry points.
+        // A stale (Deleted) entry point has no map entry. Recompute rather than take any
+        // survivor: consolidate() replaces only a Deleted one, so a peripheral id persists.
         for (auto& ep : entry_point_) {
-            ep = old_to_new_id_map.at(ep);
+            auto it = old_to_new_id_map.find(ep);
+            if (it != old_to_new_id_map.end()) {
+                ep = it->second;
+            } else if (max_index == 0) {
+                ep = 0;
+            } else {
+                ep = extensions::compute_entry_point(data_, threadpool_, [&](size_t i) {
+                    return this->is_live(i);
+                });
+            }
         }
     }
 
