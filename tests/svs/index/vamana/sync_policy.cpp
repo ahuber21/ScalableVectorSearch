@@ -20,6 +20,7 @@
 #include "svs/lib/datatype.h"
 
 #include "svs/index/vamana/dynamic_index.h"
+#include "svs/index/vamana/multi.h"
 #include "svs/index/vamana/sync_policy.h"
 
 // catch2
@@ -116,6 +117,23 @@ static_assert(sizeof(AcceptedSequential) > 0);
 
 // Rejected: SeqlockSync over non-grow-stable dataset, a static_assert failure that cannot
 // be exercised from a translation unit that must compile.
+
+// Whole-index footprint pins: main@c57d2ad7 measures 504 and 136 for these types. Peak
+// RSS cannot catch growth here, since VmHWM excludes the hugetlb pages holding datasets
+// and graphs, so this is the only detector of an inflated index.
+using SizedIndex = vamana::MutableVamanaIndex<
+    TestGraph,
+    svs::data::SimpleData<float>,
+    svs::distance::DistanceL2,
+    vamana::SequentialSync>;
+static_assert(sizeof(SizedIndex) == 504);
+
+using SizedMultiIndex = vamana::MultiMutableVamanaIndex<
+    TestGraph,
+    svs::data::SimpleData<float>,
+    svs::distance::DistanceL2,
+    vamana::SequentialSync>;
+static_assert(sizeof(SizedMultiIndex) == 136);
 
 // The whole point of NullMutex is that a member costs nothing.
 struct WithNullMutex {
