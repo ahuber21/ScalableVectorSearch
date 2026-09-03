@@ -434,9 +434,13 @@ class SimpleGraphBase {
     data_type& get_data() { return data_; }
 
     // Resizeable API
+    //
+    // Grow the access state (seqlock counters, per-node spinlocks) before publishing
+    // the larger size via data_.resize(): a reader that observes n_nodes() growing
+    // must find the corresponding counter/lock already constructed.
     void unsafe_resize(size_t new_size) {
-        data_.resize(new_size);
         access_state_.resize(new_size);
+        data_.resize(new_size);
     }
     void add_node() { unsafe_resize(n_nodes() + 1); }
 
