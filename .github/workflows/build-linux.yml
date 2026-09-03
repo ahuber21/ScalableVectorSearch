@@ -116,3 +116,38 @@ jobs:
         CTEST_OUTPUT_ON_FAILURE: 1
       working-directory: ${{ runner.temp }}/build/examples/cpp
       run: ctest -C ${{ matrix.build_type }}
+
+  tsan:
+    name: ThreadSanitizer concurrency controls
+    runs-on: ubuntu-22.04
+    # Informational: a race in the positive control is a real finding worth surfacing,
+    # but this job must not block merges, so its failure does not fail the workflow.
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Configure build
+      working-directory: ${{ runner.temp }}
+      env:
+        TEMP_WORKSPACE: ${{ runner.temp }}
+      run: |
+        cmake -B${TEMP_WORKSPACE}/build -S${GITHUB_WORKSPACE} \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DSVS_BUILD_TESTS=YES \
+              -DSVS_BUILD_TSAN_TESTS=ON \
+              -DCMAKE_CROSSCOMPILING_EMULATOR="setarch;x86_64;-R"
+
+    - name: Build TSan concurrency controls
+      working-directory: ${{ runner.temp }}/build
+      run: cmake --build . --target concurrent_tsan concurrent_tsan_negative -j $(nproc)
+
+    - name: Run TSan concurrency controls
+      env:
+        CTEST_OUTPUT_ON_FAILURE: 1
+      working-directory: ${{ runner.temp }}/build/tests
+      # -L tsan runs both controls through ctest so the negative control's WILL_FAIL
+      # is honored; running the binaries directly would lose that inversion. A race
+      # storm can make ThreadSanitizer's own reporting take minutes, so --timeout
+      # bounds each test rather than relying solely on the job-level timeout.
+      run: ctest -C RelWithDebInfo -L tsan --timeout 300
