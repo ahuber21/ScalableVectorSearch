@@ -31,7 +31,6 @@ namespace svs::index::vamana {
 struct IterativePruneStrategy {};
 struct ProgressivePruneStrategy {};
 struct LegacyPruneStrategy {};
-struct TwoPhasePruneStrategy {};
 
 // Default strategy is the iterative strategy.
 template <typename Distance> struct PruneStrategy;
@@ -81,7 +80,7 @@ As construct_as(lib::Type<As>, const N& n) {
 ///// Iterative Prune Strategy
 /////
 
-enum class PruneState : uint8_t { Available, Added, Pruned, Candidate };
+enum class PruneState : uint8_t { Available, Added, Pruned };
 
 inline PruneState reenable(PruneState state) {
     return (state == PruneState::Pruned) ? PruneState::Available : state;
@@ -171,107 +170,6 @@ void heuristic_prune_neighbors(
             state = reenable(state);
         }
         current_alpha *= alpha;
-    }
-}
-
-template <
-    data::ImmutableMemoryDataset Data,
-    data::AccessorFor<Data> Accessor,
-    distance::Distance<data::const_value_type_t<Data>, data::const_value_type_t<Data>> Dist,
-    NeighborLike Neighbors,
-    detail::IntegerOrNeighbor I,
-    typename Alloc>
-void heuristic_prune_neighbors(
-    TwoPhasePruneStrategy SVS_UNUSED(dispatch),
-    size_t max_result_size,
-    float alpha,
-    const Data& dataset,
-    const Accessor& accessor,
-    Dist& distance_function,
-    size_t current_node_id,
-    const std::span<const Neighbors>& pool,
-    std::vector<I, Alloc>& result
-) {
-    auto cmp = distance::comparator(distance_function);
-    assert(std::is_sorted(pool.begin(), pool.end(), cmp));
-    if (pool.empty()) {
-        return;
-    }
-
-    result.clear();
-    result.reserve(max_result_size);
-    size_t poolsize = pool.size();
-    if (poolsize == 0) {
-        return;
-    }
-
-    auto pruned = std::vector<PruneState>(poolsize, PruneState::Available);
-    // Phase 1: classify candidates as Pruned (eliminated) or Candidate (borderline).
-    size_t start = 0;
-    while (result.size() < max_result_size && start < poolsize) {
-        auto id = pool[start].id();
-        if (excluded(pruned[start]) || id == current_node_id) {
-            ++start;
-            continue;
-        }
-        pruned[start] = PruneState::Added;
-
-        const auto& query = accessor(dataset, id);
-        distance::maybe_fix_argument(distance_function, query);
-        result.push_back(detail::construct_as(lib::Type<I>(), pool[start]));
-        for (size_t t = start + 1; t < poolsize; ++t) {
-            if (pruned[t] == PruneState::Pruned) {
-                continue;
-            }
-
-            const auto& candidate = pool[t];
-            auto djk = distance::compute(
-                distance_function, query, accessor(dataset, candidate.id())
-            );
-
-            if (cmp(djk, candidate.distance())) {
-                if (cmp(alpha * djk, candidate.distance())) {
-                    pruned[t] = PruneState::Pruned;
-                } else {
-                    pruned[t] = PruneState::Candidate;
-                }
-            }
-        }
-        ++start;
-    }
-
-    // Phase 2: resolve Candidate nodes against each other.
-    start = 0;
-    while (result.size() < max_result_size && start < poolsize) {
-        auto id = pool[start].id();
-        if (pruned[start] != PruneState::Candidate || id == current_node_id) {
-            ++start;
-            continue;
-        }
-
-        const auto& query = accessor(dataset, id);
-        distance::maybe_fix_argument(distance_function, query);
-
-        const auto& candidate = pool[start];
-        for (size_t t = 0; t < start; ++t) {
-            if (pruned[t] != PruneState::Candidate) {
-                continue;
-            }
-
-            auto djk = distance::compute(
-                distance_function, query, accessor(dataset, pool[t].id())
-            );
-
-            if (cmp(alpha * djk, candidate.distance())) {
-                pruned[start] = PruneState::Pruned;
-                break;
-            }
-        }
-
-        if (pruned[start] == PruneState::Candidate) {
-            result.push_back(detail::construct_as(lib::Type<I>(), pool[start]));
-        }
-        ++start;
     }
 }
 
