@@ -136,7 +136,9 @@ template <typename T> class SegmentedVector {
 
     /// @brief Logical capacity: number of elements addressable without allocating a new
     /// bucket. With ``m`` buckets this is ``kFirstBucket * (2^m - 1)``.
-    size_type capacity() const noexcept { return bucket_first_index_(allocated_buckets_); }
+    size_type capacity() const noexcept {
+        return bucket_first_index_(allocated_buckets_.load(std::memory_order_relaxed));
+    }
 
     /// @brief Grow or shrink the logical size. New elements are default-constructed.
     /// Single-writer; concurrent readers safe on grow (see class contract).
@@ -190,7 +192,7 @@ template <typename T> class SegmentedVector {
     // (kFirstBucket << k) elements; the elements with global index < size_ are constructed.
     std::atomic<T*> dir_[kDirBuckets] = {};
     std::atomic<size_type> size_{0};
-    size_type allocated_buckets_{0};
+    std::atomic<size_type> allocated_buckets_{0};
 
     // Number of elements held by bucket ``b`` (= kFirstBucket << b).
     static constexpr size_type bucket_size_(size_type b) noexcept {
@@ -220,8 +222,8 @@ template <typename T> class SegmentedVector {
         if (bucket == nullptr) {
             bucket = static_cast<T*>(::operator new[](bucket_size_(b) * sizeof(T)));
             dir_[b].store(bucket, std::memory_order_release);
-            if (b + 1 > allocated_buckets_) {
-                allocated_buckets_ = b + 1;
+            if (b + 1 > allocated_buckets_.load(std::memory_order_relaxed)) {
+                allocated_buckets_.store(b + 1, std::memory_order_relaxed);
             }
         }
         return bucket;
@@ -257,8 +259,8 @@ template <typename T> class SegmentedVector {
             return;
         }
         if (n < old) {
-            // Logical-only shrink (no bucket freeing — use shrink_to for reclamation),
-            // but still destroy the dropped elements to run their destructors.
+            // Shrink is logical-only and does not free buckets; memory is retained.
+            // Call shrink_to for actual reclamation (requires readers drained).
             size_.store(n, std::memory_order_release);
             destroy_range_(n, old);
             return;
@@ -272,7 +274,7 @@ template <typename T> class SegmentedVector {
     // Free every bucket whose entire index range lies at or above ``n`` (single-writer;
     // readers drained). A bucket straddling ``n`` keeps its allocation.
     void free_buckets_above_(size_type n) {
-        for (size_type b = allocated_buckets_; b-- > 0;) {
+        for (size_type b = allocated_buckets_.load(std::memory_order_relaxed); b-- > 0;) {
             if (bucket_first_index_(b) < n) {
                 break; // this and all lower buckets contain live (or kept) elements
             }
@@ -281,14 +283,14 @@ template <typename T> class SegmentedVector {
                 ::operator delete[](static_cast<void*>(bucket));
                 dir_[b].store(nullptr, std::memory_order_relaxed);
             }
-            allocated_buckets_ = b;
+            allocated_buckets_.store(b, std::memory_order_relaxed);
         }
     }
 
     void destroy_all_() {
         size_type n = size_.load(std::memory_order_relaxed);
         destroy_range_(0, n);
-        for (size_type b = 0; b < allocated_buckets_; ++b) {
+        for (size_type b = 0; b < allocated_buckets_.load(std::memory_order_relaxed); ++b) {
             T* bucket = dir_[b].load(std::memory_order_relaxed);
             if (bucket != nullptr) {
                 ::operator delete[](static_cast<void*>(bucket));
@@ -296,7 +298,7 @@ template <typename T> class SegmentedVector {
             }
         }
         size_.store(0, std::memory_order_relaxed);
-        allocated_buckets_ = 0;
+        allocated_buckets_.store(0, std::memory_order_relaxed);
     }
 
     void copy_from_(const SegmentedVector& other) {
@@ -317,9 +319,12 @@ template <typename T> class SegmentedVector {
             other.dir_[b].store(nullptr, std::memory_order_relaxed);
         }
         size_.store(other.size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        allocated_buckets_ = other.allocated_buckets_;
+        allocated_buckets_.store(
+            other.allocated_buckets_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed
+        );
         other.size_.store(0, std::memory_order_relaxed);
-        other.allocated_buckets_ = 0;
+        other.allocated_buckets_.store(0, std::memory_order_relaxed);
     }
 };
 
