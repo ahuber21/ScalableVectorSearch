@@ -157,31 +157,40 @@ documented order given verbatim in `dynamic_index.h`:
 `Sync::mutex_type` is `std::shared_mutex` under `SeqlockSync`, which is not recursive: acquiring
 it exclusively and then, on the same thread, shared again is a hard deadlock, and acquiring it
 shared recursively can deadlock behind a writer that queued in between the two acquisitions. The
-lock order above is what keeps every acquisition path acyclic.
+lock order above is what keeps every acquisition path acyclic. Under the default `SequentialSync`,
+`Sync::mutex_type` is `lib::NullMutex` and every acquisition described in this section compiles to
+nothing; the rest of this section describes `SeqlockSync` only.
+
+The design promises multi-reader / single-writer at the index level: the four mutators —
+`add_points()`, `delete_entries()`, `consolidate()` and `compact()` — never run concurrently with
+one another, and it is the caller's obligation to keep it that way, not something the index
+enforces. Readers (searches) may run concurrently with any one mutator; concurrent insert and
+consolidate is explicitly unsupported.
 
 `compact_mutex_` has exactly one exclusive (`std::unique_lock`) acquisition in the whole class,
-inside `compact()`; every other acquisition anywhere in the class takes it with
-`std::shared_lock` — the single-query and batch `search()` overloads, `exhaustive_search()`, the
-shared-lock accessors `lock_for_search()` and `lock_for_translation()` that `BatchIterator` uses,
-and `add_points()` and `consolidate()`. **A shared `compact_mutex_` lock therefore excludes
-`compact()` and nothing else; `compact()`'s exclusive lock excludes every one of them.** In
-particular:
+inside `compact()`; every other acquisition anywhere in the class is a reader-side
+`std::shared_lock` — the single-query and batch `search()` overloads, `exhaustive_search()`, and
+the shared-lock accessors `lock_for_search()` and `lock_for_translation()` that `BatchIterator`
+uses. **The lock therefore excludes `compact()` against readers, and nothing else.** An earlier
+revision added a shared acquisition inside `add_points()` and inside `consolidate()`; both were
+removed at `9c8ee547`, because under the single-writer contract above neither mutator can overlap
+`compact()` in the first place, which made those two acquisitions redundant. Exclusion between
+`compact()` and the other three mutators comes from the contract, not from this mutex.
 
-- `add_points()` takes `compact_mutex_` shared as its first action, then `slot_alloc_mutex_` and
-  `translator_mutex_` in the documented order. The shared lock is what makes concurrent insert
-  during search — the capability this design exists to deliver — coexist with `compact()`, which
-  renumbers the very slots `add_points` indexes into and so cannot overlap it.
-- `consolidate()` takes `compact_mutex_` shared and no other index-level mutex. The per-node
-  `write_guard` inside the free `consolidate()` function it calls is what makes it safe against
-  concurrent *search*; the shared `compact_mutex_` is what makes it safe against `compact()`.
-  Those are two separate mechanisms covering two separate races — do not reason about either from
-  the other.
+`consolidate()`'s safety against concurrent *search* is a separate mechanism: the per-node seqlock
+`write_guard` inside the free `consolidate()` function at `consolidate.h:318`. Two mechanisms cover
+two separate races — do not reason about either from the other.
 
-`Sync::mutex_type` is not recursive, so neither `add_points()` nor `consolidate()` may be called
-from a context that already holds `compact_mutex_`. Nothing in the class does: the `save()`
+`Sync::mutex_type` is not recursive, so nothing in the class may acquire `compact_mutex_` while
+already holding it. `compact_mutex_` must also be acquired before a mutator uses the thread pool,
+never from inside a `threads::parallel_for` body: `NativeThreadPoolBase::parallel_for` holds one
+pool-wide, non-recursive mutex for the whole call, so a `compact_mutex_` acquisition taken inside
+the body is ordered after that pool mutex — which inverts against `compact()`, which holds
+`compact_mutex_` exclusively and then uses the pool itself. At commit `ea2c55f4`, the inverted
+ordering hung 10 of 10 runs (exit 124); a revert-only control exited 0 of 10 (exit 0). The `save()`
 overloads take no `compact_mutex_` of their own and call `consolidate()` and `compact()`
-sequentially, so each acquisition is released before the next is taken. Adding the lock to a
-caller of either function would deadlock.
+sequentially; that is sound only because the single-writer contract guarantees nothing else
+mutates the index while `save()` runs, not because of any lock `save()` holds.
 
 ## What is not yet safe
 
@@ -189,9 +198,11 @@ caller of either function would deadlock.
 `graph_.replace_node(new_id, ...)` while holding an exclusive `compact_mutex_` and never calls
 `graph_.write_guard(new_id)`, so the node's counter does not move and no reader's `read_validate`
 could detect the write. What makes that sound is the exclusive lock rather than the seqlock: every
-graph reader in the class — `search()`, `exhaustive_search()`, `BatchIterator` via
-`lock_for_search()`, `add_points()` and `consolidate()` — takes `compact_mutex_` shared, so none
-of them can run while `compact()` holds it exclusively.
+graph *reader* in the class — `search()`, `exhaustive_search()`, and `BatchIterator` via
+`lock_for_search()` — takes `compact_mutex_` shared, so none of them can run while `compact()`
+holds it exclusively. `add_points()` and `consolidate()` need no lock of their own here: the
+single-writer contract already forbids either from overlapping `compact()`, so there is nothing
+left for `compact_mutex_` to exclude on that side.
 
 The precondition is therefore "every graph reader takes `compact_mutex_`", and **nothing enforces
 it.** A reader added later without that lock compiles, links and passes, and observes torn
@@ -199,6 +210,17 @@ adjacency lists that the seqlock cannot report because `compact()` never bumps t
 cheaper of the two fixes is to take `graph_.write_guard(new_id)` in `compact()` as well, which
 costs an uncontended per-node lock on a path that is already exclusive and removes the reliance on
 a whole-class invariant; it is not done here.
+
+**The search path re-acquires `compact_mutex_` while already holding it, under `SeqlockSync`.**
+`Sync::mutex_type` is non-recursive — `lib::MovableMutex<std::shared_mutex>` under `SeqlockSync` —
+and a thread that already holds it, in any mode, may not call `lock_shared()` again: a second
+shared acquisition on the same thread is undefined behaviour per the standard, and deadlocks in
+glibc's `pthread_rwlock` as soon as `compact()` is queued waiting for the exclusive lock.
+`get_distance()` re-acquires the lock beneath the single-query and batch `search()` overloads and
+beneath `BatchIterator::next()`, both of which already hold it shared. This is a known open defect,
+deferred as a follow-up; no reproducer has been run, so its practical impact is not measured. It
+affects only `SeqlockSync`: under the default `SequentialSync`, `mutex_type` is `lib::NullMutex`
+and every acquisition described here is a no-op.
 
 **The builder's adjacency reads are not all validated.** `VamanaBuilder` routes one
 `greedy_search` call through `node_visitor_` (`vamana_build.h`), but its remaining
