@@ -26,6 +26,7 @@
 #include "catch2/catch_test_macros.hpp"
 
 // stl
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
@@ -615,10 +616,16 @@ CATCH_TEST_CASE(
     search_parameters.buffer_config({100});
     index->set_search_parameters(search_parameters);
 
-    // Counters for results - atomics because Catch2 macros are not thread-safe.
-    std::atomic<size_t> search_successes{0};
+    // Corruption counters - atomics because Catch2 macros are not thread-safe. Counting
+    // concrete failures (not "something succeeded") is what makes the assertions
+    // meaningful.
     std::atomic<size_t> search_attempts{0};
-    std::atomic<size_t> add_successes{0};
+    std::atomic<size_t> search_exceptions{0};
+    std::atomic<size_t> missing_results{0};
+    std::atomic<size_t> invalid_ids{0};
+    std::atomic<size_t> duplicate_ids{0};
+    std::atomic<size_t> out_of_order_distances{0};
+    std::atomic<size_t> add_exceptions{0};
 
     // Prepare addition batch.
     auto add_data = svs::data::SimpleData<Eltype>(kAddBatch, kDim);
@@ -628,35 +635,70 @@ CATCH_TEST_CASE(
     std::vector<size_t> add_labels(kAddBatch);
     std::iota(add_labels.begin(), add_labels.end(), kPoints);
 
-    // Launch concurrent operations.
-    auto search_worker = std::thread([&]() {
-        auto scratch = index->scratchspace(search_parameters);
-        for (size_t i = 0; i < kNumQueries; ++i) {
-            try {
-                auto query = std::span<const Eltype>(query_raw.data() + i * kDim, kDim);
-                index->search(query, scratch);
-                ++search_successes;
-            } catch (...) {
-                // Exceptions are allowed during concurrent mutation.
+    // Launch concurrent operations. Several search threads loop for the whole duration of
+    // add_points, rather than one thread making kNumQueries passes, to raise the odds that
+    // a reader's window actually overlaps a graph write.
+    constexpr size_t kNumSearchThreads = 8;
+    std::atomic<bool> stop_flag{false};
+    std::vector<std::thread> search_workers;
+    search_workers.reserve(kNumSearchThreads);
+    for (size_t t = 0; t < kNumSearchThreads; ++t) {
+        search_workers.emplace_back([&, t]() {
+            auto scratch = index->scratchspace(search_parameters);
+            size_t i = t;
+            while (!stop_flag.load(std::memory_order_acquire)) {
+                ++search_attempts;
+                auto query = std::span<const Eltype>(
+                    query_raw.data() + (i % kNumQueries) * kDim, kDim
+                );
+                try {
+                    index->search(query, scratch);
+                } catch (...) {
+                    ++search_exceptions;
+                    ++i;
+                    continue;
+                }
+                const auto& buffer = scratch.buffer;
+                if (buffer.size() == 0) {
+                    ++missing_results;
+                }
+                std::unordered_set<uint32_t> seen_ids;
+                for (size_t j = 0; j < buffer.size(); ++j) {
+                    // An id at the sentinel value means the buffer slot was never written.
+                    if (buffer[j].id() == std::numeric_limits<uint32_t>::max()) {
+                        ++invalid_ids;
+                    }
+                    if (!seen_ids.insert(buffer[j].id()).second) {
+                        ++duplicate_ids;
+                    }
+                    if (j > 0 && buffer[j].distance() < buffer[j - 1].distance()) {
+                        ++out_of_order_distances;
+                    }
+                }
+                ++i;
             }
-            ++search_attempts;
-        }
-    });
+        });
+    }
 
     auto add_worker = std::thread([&]() {
         try {
             index->add_points(add_data, add_labels);
-            ++add_successes;
-        } catch (...) {
-            // Exceptions allowed.
-        }
+        } catch (...) { ++add_exceptions; }
     });
 
-    search_worker.join();
     add_worker.join();
+    stop_flag.store(true, std::memory_order_release);
+    for (auto& worker : search_workers) {
+        worker.join();
+    }
 
-    // Verify operations completed.
-    CATCH_REQUIRE(search_attempts == kNumQueries);
-    CATCH_REQUIRE(search_successes > 0);
-    CATCH_REQUIRE(add_successes == 1);
+    // Assert on observed corruption, not on "something succeeded": a test that only checks
+    // search_successes > 0 stays green even if almost everything failed.
+    CATCH_REQUIRE(search_attempts.load(std::memory_order_acquire) > 0);
+    CATCH_REQUIRE(search_exceptions == 0);
+    CATCH_REQUIRE(missing_results == 0);
+    CATCH_REQUIRE(invalid_ids == 0);
+    CATCH_REQUIRE(duplicate_ids == 0);
+    CATCH_REQUIRE(out_of_order_distances == 0);
+    CATCH_REQUIRE(add_exceptions == 0);
 }
