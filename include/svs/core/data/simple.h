@@ -858,6 +858,8 @@ class SimpleData<T, Extent, Blocked<Alloc, Growth>> {
     /// Remove a data block from the end of the block list.
     ///
     void drop_block() {
+        // Precondition: readers must be drained before freeing the block's memory.
+        // Concurrent readers holding spans into the block will get use-after-free.
         if (!blocks_.empty()) {
             blocks_.pop_back();
         }
@@ -874,6 +876,8 @@ class SimpleData<T, Extent, Blocked<Alloc, Growth>> {
             growth_traits::write_size(size_, new_size);
         } else if (new_size < size()) {
             growth_traits::write_size(size_, new_size);
+            // Precondition: readers must be drained before drop_block() frees memory.
+            // Concurrent readers holding spans into freed blocks will get use-after-free.
             while (capacity() - blocksize().value() > new_size) {
                 drop_block();
             }
