@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <concepts>
 #include <type_traits>
 #include <utility>
@@ -33,10 +34,21 @@ template <typename Mutex> class MovableMutex {
     MovableMutex(const MovableMutex&) = delete;
     MovableMutex& operator=(const MovableMutex&) = delete;
 
-    MovableMutex(MovableMutex&&) noexcept
-        : mutex_{} {}
+    MovableMutex(MovableMutex&& other) noexcept
+        : mutex_{} {
+        // Verify the source is not locked before move-construction.
+        // Locked source + move leads to undefined behavior (new owner unaware of holders).
+        assert(other.try_lock() && (other.unlock(), true));
+        (void)other; // Suppress unused parameter warning when assert compiles out.
+    }
 
-    MovableMutex& operator=(MovableMutex&&) noexcept { return *this; }
+    MovableMutex& operator=(MovableMutex&& other) noexcept {
+        // Verify the source is not locked before move-assignment.
+        // Locked source + move leads to undefined behavior (new owner unaware of holders).
+        assert(other.try_lock() && (other.unlock(), true));
+        (void)other; // Suppress unused parameter warning when assert compiles out.
+        return *this;
+    }
 
     ~MovableMutex() = default;
 
