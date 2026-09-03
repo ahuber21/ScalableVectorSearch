@@ -41,6 +41,8 @@ template <typename T> class AtomicSpan {
       public:
         using value_type = AtomicSpan::value_type;
         using difference_type = std::ptrdiff_t;
+        // Deliberately weaker than random_access: a random-access iterator lets range
+        // algorithms bulk-copy the adjacency, bypassing the per-element atomic loads.
         using iterator_category = std::input_iterator_tag;
 
         explicit iterator(const T* p)
