@@ -16,8 +16,6 @@
 
 #pragma once
 
-// The core headers must precede the index headers: index templates issue qualified
-// calls into `distance` that bind their candidate set at definition context.
 #include "svs/core/data/simple.h"
 #include "svs/core/graph/graph.h"
 #include "svs/lib/concurrency/atomic_value.h"
@@ -100,18 +98,16 @@ class AtomicCounter {
 };
 
 /// @brief Counter usable for the index's slot bookkeeping.
+// clang-format off
 template <typename C>
 concept SyncCounter =
     std::default_initializable<C> && requires(C& counter) {
-                                         {
-                                             std::as_const(counter).load()
-                                             } -> std::convertible_to<size_t>;
-                                         counter.store(size_t{});
-                                         counter.fetch_max(size_t{});
-                                         {
-                                             counter.fetch_add(size_t{})
-                                             } -> std::convertible_to<size_t>;
-                                     };
+        { std::as_const(counter).load() } -> std::convertible_to<size_t>;
+        counter.store(size_t{});
+        counter.fetch_max(size_t{});
+        { counter.fetch_add(size_t{}) } -> std::convertible_to<size_t>;
+    };
+// clang-format on
 
 /// @brief Bundle of the synchronization seams used by the mutable Vamana index.
 ///
