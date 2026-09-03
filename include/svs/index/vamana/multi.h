@@ -400,10 +400,14 @@ class MultiMutableVamanaIndex {
         );
     }
 
-    const label_to_external_type& get_label_to_external_lookup() const {
+    // Returning a reference would let a caller read the map without holding its mutex,
+    // defeating the lock that guards concurrent mutation.
+    label_to_external_type get_label_to_external_lookup() const {
+        std::shared_lock l2e_lock{l2e_mutex_};
         return label_to_external_;
     }
-    const external_to_label_type& get_external_to_label_lookup() const {
+    external_to_label_type get_external_to_label_lookup() const {
+        std::shared_lock e2l_lock{e2l_mutex_};
         return external_to_label_;
     }
     const ParentIndex& get_parent_index() const { return *index_; }
@@ -651,9 +655,18 @@ class MultiMutableVamanaIndex {
     ///     each external ID in the index.
     ///
     template <typename F> void on_ids(F&& f) const {
-        std::shared_lock l2e_lock{l2e_mutex_};
-        for (auto pair : label_to_external_) {
-            f(pair.first);
+        // Snapshot before invoking f: l2e_mutex_ is non-recursive, so holding it across a
+        // caller-supplied callback that re-enters the index deadlocks.
+        std::vector<label_type> labels;
+        {
+            std::shared_lock l2e_lock{l2e_mutex_};
+            labels.reserve(label_to_external_.size());
+            for (auto& pair : label_to_external_) {
+                labels.push_back(pair.first);
+            }
+        }
+        for (auto label : labels) {
+            f(label);
         }
     }
 
