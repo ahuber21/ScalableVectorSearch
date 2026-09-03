@@ -46,6 +46,7 @@
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -105,15 +106,22 @@ std::unique_ptr<ConcurrentIndex> build_index(
 }
 
 // Timeout wrapper: returns true if operation completes, false if it times out.
+// On timeout the worker is detached, so its state must outlive this call: heap-own it in a
+// shared_ptr captured by value, or the detached thread writes through dangling references.
 template <typename F> bool with_timeout(F&& operation, std::chrono::milliseconds timeout) {
-    std::atomic<bool> done{false};
-    std::thread worker{[&] {
-        std::forward<F>(operation)();
-        done.store(true, std::memory_order_release);
+    struct State {
+        std::decay_t<F> operation;
+        std::atomic<bool> done{false};
+    };
+    auto state = std::make_shared<State>(std::forward<F>(operation));
+
+    std::thread worker{[state] {
+        state->operation();
+        state->done.store(true, std::memory_order_release);
     }};
 
     const auto start = std::chrono::steady_clock::now();
-    while (!done.load(std::memory_order_acquire)) {
+    while (!state->done.load(std::memory_order_acquire)) {
         if (std::chrono::steady_clock::now() - start > timeout) {
             worker.detach();
             return false;
