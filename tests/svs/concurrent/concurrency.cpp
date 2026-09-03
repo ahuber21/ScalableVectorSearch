@@ -684,8 +684,6 @@ CATCH_TEST_CASE("Report MutableVamanaIndex footprint", "[.][footprint]") {
     CATCH_REQUIRE(true);
 }
 
-// AR-20 excludes add_points()/consolidate() from compact() via compact_mutex_; without it,
-// compact() can resize data_/graph_ underneath an in-flight add_points.
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex compact during mutation", "[concurrent][index]"
 ) {
@@ -728,8 +726,7 @@ CATCH_TEST_CASE(
     index->consolidate();
     index->compact();
 
-    std::atomic<size_t> writers_running{0};
-    std::atomic<size_t> compactor_running{0};
+    std::atomic<bool> mutation_active{true};
     std::atomic<size_t> searches_completed{0};
     std::atomic<size_t> compacts_completed{0};
     std::atomic<size_t> exceptions{0};
@@ -755,11 +752,10 @@ CATCH_TEST_CASE(
                 e.what()
             );
         }
-        writers_running.fetch_sub(1);
     };
 
-    // No further deletions occur, so each compact() below is an identity remap; it still
-    // races add_points growing data_/graph_ against a size snapshot taken at its own start.
+    // No further deletions occur, so each compact() below is an identity remap; it runs
+    // only once every writer has joined, per the single-writer contract.
     auto compactor = [&] {
         size_t c = 0;
         try {
@@ -774,15 +770,13 @@ CATCH_TEST_CASE(
                 "compactor round=" + std::to_string(c) + ": " + e.what()
             );
         }
-        compactor_running.store(0);
     };
 
     auto searcher = [&] {
         size_t q = 0;
         try {
             auto scratch = index->scratchspace();
-            while (writers_running.load(std::memory_order_relaxed) != 0 ||
-                   compactor_running.load(std::memory_order_relaxed) != 0) {
+            while (mutation_active.load(std::memory_order_relaxed)) {
                 for (q = 0; q < local_queries; ++q) {
                     auto query =
                         std::span<const float>(queries_raw.data() + q * kDim, kDim);
@@ -801,17 +795,25 @@ CATCH_TEST_CASE(
         }
     };
 
-    std::vector<std::thread> threads;
-    writers_running.store(local_writers);
-    compactor_running.store(1);
-    for (size_t w = 0; w < local_writers; ++w) {
-        threads.emplace_back(writer, w);
-    }
-    threads.emplace_back(compactor);
+    std::vector<std::thread> searcher_threads;
     for (int i = 0; i < local_searchers; ++i) {
-        threads.emplace_back(searcher);
+        searcher_threads.emplace_back(searcher);
     }
-    for (auto& t : threads) {
+
+    // Writers and the compactor run in sequence, never overlapping each other, per the
+    // single-writer contract; searchers span both phases and stay under concurrent test.
+    std::vector<std::thread> writer_threads;
+    for (size_t w = 0; w < local_writers; ++w) {
+        writer_threads.emplace_back(writer, w);
+    }
+    for (auto& t : writer_threads) {
+        t.join();
+    }
+    std::thread compactor_thread(compactor);
+    compactor_thread.join();
+
+    mutation_active.store(false, std::memory_order_relaxed);
+    for (auto& t : searcher_threads) {
         t.join();
     }
 
@@ -841,8 +843,8 @@ CATCH_TEST_CASE(
     CATCH_REQUIRE(recall > 0.85);
 }
 
-// VamanaBuilder can wire an edge to an already-Deleted node; it survives consolidate() and
-// only throws later in compact(). Unlike "compact during mutation", no quiescent reclaim.
+// add_points and delete/consolidate run in sequence, per the single-writer contract;
+// search spans both. Unlike "compact during mutation", no quiescent reclaim precedes them.
 CATCH_TEST_CASE(
     "Concurrent MutableVamanaIndex add_points during consolidate", "[concurrent]"
 ) {
@@ -855,6 +857,7 @@ CATCH_TEST_CASE(
     const size_t local_batch = envnum("SVS_ADC_BATCH", 5);
     const size_t local_rounds = envnum("SVS_ADC_ROUNDS", 40);
     const size_t local_queries = envnum("SVS_ADC_QUERIES", 10);
+    const int local_searchers = static_cast<int>(envnum("SVS_ADC_SEARCHERS", 1));
 
     const size_t total = local_initial + local_incremental;
     auto base = random_vectors(total, kDim, 3691);
@@ -872,12 +875,14 @@ CATCH_TEST_CASE(
 
     auto queries_raw = random_vectors(local_queries, kDim, 1590);
 
+    std::atomic<bool> mutation_active{true};
+    std::atomic<size_t> searches_completed{0};
     std::atomic<size_t> exceptions{0};
-    // Guards exception_log; appended only from the two catch blocks below, read only
-    // after both threads have joined.
+    // Guards exception_log; appended only from the catch blocks below, read only
+    // after every thread has joined.
     std::mutex exception_log_mutex;
     std::vector<std::string> exception_log;
-    // Written only by the consolidator thread; read only after it joins.
+    // Written only by the consolidator; read only after it joins.
     std::unordered_set<size_t> deleted_ids;
 
     auto inserter = [&] {
@@ -897,8 +902,7 @@ CATCH_TEST_CASE(
     };
 
     // Deletes a fresh residue class of original ids each round, then consolidates
-    // immediately, so its in-edge reroute for this round's ids can settle while the
-    // inserter above may still be wiring new edges into them.
+    // immediately; runs only once the inserter above has joined.
     auto deleter_consolidator = [&] {
         size_t round = 0;
         try {
@@ -920,10 +924,45 @@ CATCH_TEST_CASE(
         }
     };
 
+    auto searcher = [&] {
+        size_t q = 0;
+        try {
+            auto scratch = index->scratchspace();
+            while (mutation_active.load(std::memory_order_relaxed)) {
+                for (q = 0; q < local_queries; ++q) {
+                    auto query =
+                        std::span<const float>(queries_raw.data() + q * kDim, kDim);
+                    index->search(query, scratch);
+                    searches_completed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } catch (const std::exception& e) {
+            exceptions.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> guard(exception_log_mutex);
+            exception_log.push_back(
+                "searcher query=" + std::to_string(q) + " completed=" +
+                std::to_string(searches_completed.load(std::memory_order_relaxed)) + ": " +
+                e.what()
+            );
+        }
+    };
+
+    std::vector<std::thread> searcher_threads;
+    for (int i = 0; i < local_searchers; ++i) {
+        searcher_threads.emplace_back(searcher);
+    }
+
+    // Inserter and consolidator run in sequence, never overlapping each other, per the
+    // single-writer contract; searchers span both phases and stay under concurrent test.
     std::thread inserter_thread(inserter);
-    std::thread consolidator_thread(deleter_consolidator);
     inserter_thread.join();
+    std::thread consolidator_thread(deleter_consolidator);
     consolidator_thread.join();
+
+    mutation_active.store(false, std::memory_order_relaxed);
+    for (auto& t : searcher_threads) {
+        t.join();
+    }
 
     std::string exception_report;
     for (const auto& msg : exception_log) {
@@ -931,9 +970,10 @@ CATCH_TEST_CASE(
     }
     CATCH_INFO("captured exceptions: " << exception_report);
     CATCH_REQUIRE(exceptions.load() == 0);
+    CATCH_REQUIRE(searches_completed.load() > 0);
 
-    // Directly detects a valid node wired to a Deleted neighbor -- the corruption this
-    // test targets -- without needing compact() to turn it into a thrown exception.
+    // Directly detects a valid node wired to a Deleted neighbor, without needing
+    // compact() to turn it into a thrown exception.
     std::string invariant_exception;
     try {
         index->debug_check_invariants(false);
@@ -941,8 +981,8 @@ CATCH_TEST_CASE(
     CATCH_INFO("debug_check_invariants(false): " << invariant_exception);
     CATCH_REQUIRE(invariant_exception.empty());
 
-    // The production symptom: compact() removes a Deleted slot, and a stale edge into it
-    // (one consolidate() never got a chance to reroute) throws when compact() remaps it.
+    // A stale edge into a Deleted slot that consolidate() never got a chance to reroute
+    // throws when compact() remaps it.
     std::string compact_exception;
     try {
         index->compact();
