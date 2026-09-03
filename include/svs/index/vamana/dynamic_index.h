@@ -187,15 +187,14 @@ class MutableVamanaIndex {
 
     graph_type graph_;
     data_type data_;
-    // Search and consolidate() both take only a *shared* lock on compact_mutex_, so it
-    // never serializes their access to slot 0; entry_point()/set_entry_point() do instead.
+    // Search takes only a *shared* lock on compact_mutex_, so it never serializes
+    // with itself for slot 0 access; entry_point()/set_entry_point() do instead.
     entry_point_type entry_point_;
     status_type status_;
     typename Sync::counter_type first_empty_;
     IDTranslator translator_;
-    // Lock order: compact_mutex_ → slot_alloc_mutex_ and compact_mutex_ →
-    // translator_mutex_. Violating this order causes deadlock; release compact_mutex_
-    // before acquiring others.
+    // compact_mutex_ excludes only compact() (unique_lock) from readers
+    // (shared_lock); no other mutator acquires it.
     [[no_unique_address]] typename Sync::mutex_type slot_alloc_mutex_;
     [[no_unique_address]] mutable typename Sync::mutex_type translator_mutex_;
     [[no_unique_address]] mutable typename Sync::mutex_type compact_mutex_;
@@ -808,9 +807,6 @@ class MutableVamanaIndex {
     std::vector<size_t> add_points(
         const Points& points, const ExternalIds& external_ids, bool reuse_empty = false
     ) {
-        // Excludes concurrent compact(), which renumbers slots this indexes into.
-        // Must precede slot_alloc_mutex_/translator_mutex_ per the lock order above.
-        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
         const size_t num_points = points.size();
         const size_t num_ids = external_ids.size();
         if (num_points != num_ids) {
@@ -1216,8 +1212,6 @@ class MutableVamanaIndex {
 
     ///// Mutation
     void consolidate() {
-        // Excludes concurrent compact(); consolidate() takes no other index-level mutex.
-        std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
         // The free consolidate() below reads adjacency lists without seqlock validation;
         // safe only because no second mutator runs concurrently to tear a list mid-prune.
         auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
