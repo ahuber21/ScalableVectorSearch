@@ -68,6 +68,8 @@ class SeqLockCounter {
     counter_type begin_write() {
         auto seq = seq_.load(std::memory_order_relaxed);
         seq_.store(seq + 1, std::memory_order_relaxed);
+        // Separate release fence orders both this counter store and caller's adjacent
+        // writes.
         std::atomic_thread_fence(std::memory_order_release);
         return seq;
     }
