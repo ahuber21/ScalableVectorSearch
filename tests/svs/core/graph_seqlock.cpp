@@ -31,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -237,30 +238,107 @@ CATCH_TEST_CASE("SeqlockVisitor retries on validation failure", "[graphs][seqloc
         svs::graphs::SeqlockAccess>;
 
     constexpr size_t n_nodes = 10;
-    constexpr size_t max_degree = 5;
+    constexpr size_t max_degree = 64;
+    constexpr Idx test_node = 5;
 
     SeqlockGraph graph(n_nodes, max_degree);
 
-    // Initialize with some edges
-    for (Idx i = 0; i < n_nodes; ++i) {
-        std::vector<Idx> neighbors;
-        for (size_t j = 1; j <= max_degree; ++j) {
-            neighbors.push_back((i + j) % n_nodes);
-        }
-        graph.replace_node(i, neighbors);
+    // Two distinct valid states for the test node; a torn read produces neither.
+    std::vector<Idx> state_a(max_degree);
+    std::vector<Idx> state_b(max_degree);
+    for (size_t i = 0; i < max_degree; ++i) {
+        state_a[i] = static_cast<Idx>(i);
+        state_b[i] = static_cast<Idx>(max_degree + i);
     }
+    graph.replace_node(test_node, state_a);
 
-    // Create visitor
     svs::index::vamana::SeqlockVisitor visitor{};
-
-    // Test that visitor executes the body and it satisfies NodeVisitor
     static_assert(svs::index::vamana::
                       NodeVisitor<svs::index::vamana::SeqlockVisitor, SeqlockGraph>);
 
-    size_t executions = 0;
-    visitor(graph, 5, [&](const auto& /*neighbors*/) { ++executions; });
+    constexpr size_t num_readers = 4;
+#ifdef __SANITIZE_THREAD__
+    constexpr size_t iterations = 500;
+#else
+    constexpr size_t iterations = 20000;
+#endif
 
-    CATCH_REQUIRE(executions > 0);
+    std::atomic<bool> start_flag{false};
+    std::atomic<bool> stop_flag{false};
+    std::array<std::atomic<size_t>, num_readers> completed{};
+
+    // Catch2 assertions are not thread-safe; accumulate counts for a main-thread check.
+    // corrupted is the correctness signal; budget_exceeded is a contention side effect of
+    // SeqlockVisitor's own yield bound and is not evidence of a torn read.
+    std::atomic<size_t> corrupted{0};
+    std::atomic<size_t> budget_exceeded{0};
+
+    // Writer thread: alternate between state_a and state_b under the write guard. Yielding
+    // between writes keeps contention realistic instead of pegging readers against a
+    // back-to-back write stream.
+    auto writer = std::thread([&]() {
+        while (!start_flag.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        bool use_a = false;
+        while (!stop_flag.load(std::memory_order_acquire)) {
+            {
+                auto guard = graph.write_guard(test_node);
+                graph.replace_node(test_node, use_a ? state_a : state_b);
+                use_a = !use_a;
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    // Reader threads drive the production SeqlockVisitor directly: if its retry loop is
+    // removed, the body below observes a torn snapshot instead of exactly state_a/state_b.
+    std::array<std::thread, num_readers> readers;
+    for (size_t tid = 0; tid < num_readers; ++tid) {
+        readers[tid] = std::thread([&, tid]() {
+            while (!start_flag.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            size_t done = 0;
+            for (size_t iter = 0; iter < iterations; ++iter) {
+                try {
+                    visitor(graph, test_node, [&](std::span<const Idx> neighbors) {
+                        bool is_a =
+                            std::equal(neighbors.begin(), neighbors.end(), state_a.begin());
+                        bool is_b =
+                            std::equal(neighbors.begin(), neighbors.end(), state_b.begin());
+                        if (neighbors.size() != max_degree || !(is_a || is_b)) {
+                            corrupted.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    });
+                } catch (const svs::ANNException&) {
+                    // SeqlockVisitor gave up after its own yield bound: a liveness limit
+                    // under contention, not a torn read.
+                    budget_exceeded.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++done;
+            }
+            completed[tid].store(done, std::memory_order_release);
+        });
+    }
+
+    start_flag.store(true, std::memory_order_release);
+    for (auto& r : readers) {
+        r.join();
+    }
+    stop_flag.store(true, std::memory_order_release);
+    writer.join();
+
+    for (size_t tid = 0; tid < num_readers; ++tid) {
+        CATCH_REQUIRE(completed[tid].load(std::memory_order_acquire) == iterations);
+    }
+    // Correctness: every validated snapshot the visitor handed to the body was intact.
+    CATCH_REQUIRE(corrupted.load(std::memory_order_acquire) == 0);
+    // Liveness sanity: contention did not starve every single reader iteration.
+    CATCH_REQUIRE(
+        budget_exceeded.load(std::memory_order_acquire) < num_readers * iterations
+    );
 }
 
 CATCH_TEST_CASE("Seqlock access control negative test", "[graphs][seqlock]") {
