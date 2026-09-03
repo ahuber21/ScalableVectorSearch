@@ -19,6 +19,9 @@
 #include "svs/concepts/data.h"
 #include "svs/concepts/distance.h"
 #include "svs/concepts/graph.h"
+#include "svs/core/distance/cosine.h"
+#include "svs/core/distance/euclidean.h"
+#include "svs/core/distance/inner_product.h"
 #include "svs/index/vamana/search_buffer.h"
 
 #include <algorithm>
