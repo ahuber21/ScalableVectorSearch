@@ -747,7 +747,7 @@ class MultiMutableVamanaIndex {
 
     VamanaIndexParameters get_parameters() const {
         return {
-            index_->entry_point_.front(),
+            index_->entry_point(),
             {get_alpha(),
              max_degree(),
              get_construction_window_size(),
