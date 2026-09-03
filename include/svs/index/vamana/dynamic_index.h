@@ -17,6 +17,7 @@
 #pragma once
 
 // stdlib
+#include <atomic>
 #include <memory>
 
 // Include the flat index to spin-up exhaustive searches on demand.
@@ -186,6 +187,8 @@ class MutableVamanaIndex {
 
     graph_type graph_;
     data_type data_;
+    // Search and consolidate() both take only a *shared* lock on compact_mutex_, so it
+    // never serializes their access to slot 0; entry_point()/set_entry_point() do instead.
     entry_point_type entry_point_;
     status_type status_;
     typename Sync::counter_type first_empty_;
@@ -588,6 +591,9 @@ class MutableVamanaIndex {
         return [&, prefetch_parameters](
                    const auto& query, auto& accessor, auto& distance, auto& buffer
                ) {
+            // Snapshot via an atomic load: a concurrent mutator may rewrite slot 0 while
+            // this search is in flight, and the span below must not alias that storage.
+            Idx ep = entry_point();
             // Perform the greedy search using the provided resources.
             greedy_search(
                 graph_,
@@ -596,7 +602,7 @@ class MutableVamanaIndex {
                 query,
                 distance,
                 buffer,
-                vamana::EntryPointInitializer<Idx>{lib::as_const_span(entry_point_)},
+                vamana::EntryPointInitializer<Idx>{std::span<const Idx>(&ep, 1)},
                 internal_search_builder(),
                 prefetch_parameters,
                 cancel,
@@ -633,40 +639,39 @@ class MutableVamanaIndex {
         const search_parameters_type& sp,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) {
-        {
-            std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
-            threads::parallel_for(
-                threadpool_,
-                threads::StaticPartition{queries.size()},
-                [&](const auto is, uint64_t SVS_UNUSED(tid)) {
-                    size_t num_neighbors = results.n_neighbors();
-                    auto buffer = search_buffer_type{
-                        sp.buffer_config_, distance::comparator(distance_)};
+        threads::parallel_for(
+            threadpool_,
+            threads::StaticPartition{queries.size()},
+            [&](const auto is, uint64_t SVS_UNUSED(tid)) {
+                // Acquired per chunk, not once for the whole batch: a reader-preferring
+                // rwlock held for the batch's whole duration can starve compact() outright.
+                std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
+                size_t num_neighbors = results.n_neighbors();
+                auto buffer =
+                    search_buffer_type{sp.buffer_config_, distance::comparator(distance_)};
 
-                    auto prefetch_parameters = GreedySearchPrefetchParameters{
-                        sp.prefetch_lookahead_, sp.prefetch_step_};
+                auto prefetch_parameters = GreedySearchPrefetchParameters{
+                    sp.prefetch_lookahead_, sp.prefetch_step_};
 
-                    // Legalize search buffer for this search.
-                    if (buffer.target_capacity() < num_neighbors) {
-                        buffer.change_maxsize(num_neighbors);
-                    }
-                    auto scratch =
-                        extensions::per_thread_batch_search_setup(data_, distance_);
-
-                    extensions::per_thread_batch_search(
-                        data_,
-                        buffer,
-                        scratch,
-                        queries,
-                        results,
-                        threads::UnitRange{is},
-                        greedy_search_closure(prefetch_parameters, cancel),
-                        *this,
-                        cancel
-                    );
+                // Legalize search buffer for this search.
+                if (buffer.target_capacity() < num_neighbors) {
+                    buffer.change_maxsize(num_neighbors);
                 }
-            );
-        }
+                auto scratch = extensions::per_thread_batch_search_setup(data_, distance_);
+
+                extensions::per_thread_batch_search(
+                    data_,
+                    buffer,
+                    scratch,
+                    queries,
+                    results,
+                    threads::UnitRange{is},
+                    greedy_search_closure(prefetch_parameters, cancel),
+                    *this,
+                    cancel
+                );
+            }
+        );
 
         // Check if request to cancel the search
         if (cancel()) {
@@ -1000,10 +1005,14 @@ class MutableVamanaIndex {
     // neither relocates a slot an inserter is writing nor degenerates into an identity map.
     bool is_live(size_t i) const { return status_[i] == SlotMetadata::Valid; }
 
+    void set_entry_point(Idx value) {
+        std::atomic_ref<Idx>(entry_point_[0]).store(value, std::memory_order_release);
+    }
+
   public:
     Idx entry_point() const {
         assert(entry_point_.size() == 1);
-        return entry_point_[0];
+        return std::atomic_ref<const Idx>(entry_point_[0]).load(std::memory_order_acquire);
     }
 
     ///
@@ -1030,6 +1039,8 @@ class MutableVamanaIndex {
     ///
     void compact(Idx batch_size = 1'000) {
         std::unique_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
+        // status_'s allocated memory does not shrink below its peak after this call:
+        // SegmentedVector's shrink is logical only, unlike the dataset blocks below.
         // Step 1: Compute a prefix-sum matching each valid internal index to its new
         // internal index.
         //
@@ -1130,17 +1141,16 @@ class MutableVamanaIndex {
 
         // A stale (Deleted) entry point has no map entry. Recompute rather than take any
         // survivor: consolidate() replaces only a Deleted one, so a peripheral id persists.
-        for (auto& ep : entry_point_) {
-            auto it = old_to_new_id_map.find(ep);
-            if (it != old_to_new_id_map.end()) {
-                ep = it->second;
-            } else if (max_index == 0) {
-                ep = 0;
-            } else {
-                ep = extensions::compute_entry_point(data_, threadpool_, [&](size_t i) {
-                    return this->is_live(i);
-                });
-            }
+        assert(entry_point_.size() == 1);
+        auto it = old_to_new_id_map.find(entry_point());
+        if (it != old_to_new_id_map.end()) {
+            set_entry_point(it->second);
+        } else if (max_index == 0) {
+            set_entry_point(0);
+        } else {
+            set_entry_point(extensions::compute_entry_point(
+                data_, threadpool_, [&](size_t i) { return this->is_live(i); }
+            ));
         }
     }
 
@@ -1205,20 +1215,21 @@ class MutableVamanaIndex {
     void consolidate() {
         // Excludes concurrent compact(); consolidate() takes no other index-level mutex.
         std::shared_lock<typename Sync::mutex_type> compact_lock(compact_mutex_);
+        // The free consolidate() below reads adjacency lists without seqlock validation;
+        // safe only because no second mutator runs concurrently to tear a list mid-prune.
         auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
         std::function<bool(size_t)> valid = [&](size_t i) { return this->is_live(i); };
 
         // Determine if the entry point is deleted.
         // If so - we need to pick a new one.
-        assert(entry_point_.size() == 1);
-        auto entry_point = entry_point_[0];
-        if (status_.at(entry_point) == SlotMetadata::Deleted) {
+        auto old_entry_point = entry_point();
+        if (status_.at(old_entry_point) == SlotMetadata::Deleted) {
             svs::logging::debug(logger_, "Replacing entry point.");
             auto new_entry_point =
                 extensions::compute_entry_point(data_, threadpool_, valid);
             svs::logging::debug(logger_, "New point: {}", new_entry_point);
             assert(is_live(new_entry_point));
-            entry_point_[0] = new_entry_point;
+            set_entry_point(new_entry_point);
         }
 
         // Perform graph consolidation.
@@ -1248,7 +1259,7 @@ class MutableVamanaIndex {
 
     VamanaIndexParameters parameters() const {
         return {
-            entry_point_.front(),
+            entry_point(),
             {alpha_,
              graph_.max_degree(),
              get_construction_window_size(),
