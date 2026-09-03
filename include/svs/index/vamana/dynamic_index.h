@@ -639,39 +639,42 @@ class MutableVamanaIndex {
         const search_parameters_type& sp,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) {
-        threads::parallel_for(
-            threadpool_,
-            threads::StaticPartition{queries.size()},
-            [&](const auto is, uint64_t SVS_UNUSED(tid)) {
-                // Acquired per chunk, not once for the whole batch: a reader-preferring
-                // rwlock held for the batch's whole duration can starve compact() outright.
-                std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
-                size_t num_neighbors = results.n_neighbors();
-                auto buffer =
-                    search_buffer_type{sp.buffer_config_, distance::comparator(distance_)};
+        {
+            // Held for the whole parallel_for, not per chunk: the pool takes one
+            // non-recursive mutex per call, so acquiring inside it deadlocks compact().
+            std::shared_lock<typename Sync::mutex_type> lock(compact_mutex_);
+            threads::parallel_for(
+                threadpool_,
+                threads::StaticPartition{queries.size()},
+                [&](const auto is, uint64_t SVS_UNUSED(tid)) {
+                    size_t num_neighbors = results.n_neighbors();
+                    auto buffer = search_buffer_type{
+                        sp.buffer_config_, distance::comparator(distance_)};
 
-                auto prefetch_parameters = GreedySearchPrefetchParameters{
-                    sp.prefetch_lookahead_, sp.prefetch_step_};
+                    auto prefetch_parameters = GreedySearchPrefetchParameters{
+                        sp.prefetch_lookahead_, sp.prefetch_step_};
 
-                // Legalize search buffer for this search.
-                if (buffer.target_capacity() < num_neighbors) {
-                    buffer.change_maxsize(num_neighbors);
+                    // Legalize search buffer for this search.
+                    if (buffer.target_capacity() < num_neighbors) {
+                        buffer.change_maxsize(num_neighbors);
+                    }
+                    auto scratch =
+                        extensions::per_thread_batch_search_setup(data_, distance_);
+
+                    extensions::per_thread_batch_search(
+                        data_,
+                        buffer,
+                        scratch,
+                        queries,
+                        results,
+                        threads::UnitRange{is},
+                        greedy_search_closure(prefetch_parameters, cancel),
+                        *this,
+                        cancel
+                    );
                 }
-                auto scratch = extensions::per_thread_batch_search_setup(data_, distance_);
-
-                extensions::per_thread_batch_search(
-                    data_,
-                    buffer,
-                    scratch,
-                    queries,
-                    results,
-                    threads::UnitRange{is},
-                    greedy_search_closure(prefetch_parameters, cancel),
-                    *this,
-                    cancel
-                );
-            }
-        );
+            );
+        }
 
         // Check if request to cancel the search
         if (cancel()) {
