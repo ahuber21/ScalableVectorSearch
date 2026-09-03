@@ -23,7 +23,6 @@
 #include "svs/index/vamana/prune.h"
 #include "svs/lib/array.h"
 #include "svs/lib/narrow.h"
-#include "svs/lib/reverse_edges.h"
 #include "svs/lib/threads.h"
 #include "svs/lib/timing.h"
 
@@ -377,33 +376,6 @@ class GraphConsolidator {
         const size_t num_nodes = graph_.n_nodes();
         threads::UnitRange<size_t> all_ids{0, num_nodes};
         run_driver(all_ids, is_deleted);
-    }
-
-    ///
-    /// Partial consolidation: process only nodes affected by the deleted set.
-    /// Requires graph to provide reverse edges for discovering in-neighbors.
-    ///
-    template <typename DeletedSet, typename Deleted>
-        requires requires(Graph& g) {
-                     { g.reverse_edges() } -> std::convertible_to<lib::ReverseEdges<I>*>;
-                 }
-    void operator()(const DeletedSet& deleted_ids, const Deleted& is_deleted) {
-        auto* reverse_edges = graph_.reverse_edges();
-        assert(reverse_edges != nullptr);
-
-        tsl::robin_set<size_t> work{};
-        for (auto d : deleted_ids) {
-            const auto& neighbors = graph_.get_node(lib::narrow_cast<I>(d));
-            for (auto a : neighbors) {
-                if (!is_deleted(a)) {
-                    work.insert(a);
-                }
-            }
-            reverse_edges->collect(lib::narrow_cast<I>(d), work, is_deleted);
-        }
-
-        std::vector<size_t> work_ids(work.begin(), work.end());
-        run_driver(work_ids, is_deleted);
     }
 };
 

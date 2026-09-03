@@ -81,7 +81,6 @@ set(TEST_SOURCES
     ${TEST_DIR}/svs/lib/scopeguard.cpp
     ${TEST_DIR}/svs/lib/segmented_vector.cpp
     ${TEST_DIR}/svs/lib/spinlock.cpp
-    ${TEST_DIR}/svs/lib/reverse_edges.cpp
     ${TEST_DIR}/svs/lib/static.cpp
     ${TEST_DIR}/svs/lib/timing.cpp
     ${TEST_DIR}/svs/lib/tuples.cpp
